@@ -1,0 +1,1660 @@
+import os
+import math
+import numpy as np
+from osgeo import gdal
+from copy import deepcopy
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.nn import functional as F
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+import time
+import seaborn as sns
+import pandas as pd
+from scipy import ndimage
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Clear GPU memory
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+
+def readraster(file):
+    """Read raster file and handle NoData values properly"""
+    dataSource = gdal.Open(file)
+    if dataSource is None:
+        raise FileNotFoundError(f"Unable to open raster: {file}")
+    band = dataSource.GetRasterBand(1)
+    band_array = band.ReadAsArray()
+
+    # Get NoData value
+    nodata = band.GetNoDataValue()
+    if nodata is not None:
+        band_array = np.where(band_array == nodata, np.nan, band_array)
+
+    # Also replace extreme values that might be NoData
+    band_array = np.where(band_array < -1e10, np.nan, band_array)
+    band_array = np.where(band_array > 1e10, np.nan, band_array)
+
+    return dataSource, band_array
+
+
+def identicalList(inList):
+    inList = np.array(inList)
+    if len(inList) == 0:
+        return True
+    logical = inList == inList[0]
+    return bool(np.all(logical))
+
+
+class LSTData:
+    def __init__(self, lst_files, landuse_files, ndvi_files, emissivity_files):
+        # Load LST data
+        self.ds_lst1, self.arr_lst1 = readraster(lst_files[0])
+        self.ds_lst2, self.arr_lst2 = readraster(lst_files[1])
+        self.ds_lst3, self.arr_lst3 = readraster(lst_files[2])
+
+        # Load land use data
+        self.ds_lu1, self.arr_lu1 = readraster(landuse_files[0])
+        self.ds_lu2, self.arr_lu2 = readraster(landuse_files[1])
+        self.ds_lu3, self.arr_lu3 = readraster(landuse_files[2])
+
+        # Load NDVI data
+        self.ds_ndvi1, self.arr_ndvi1 = readraster(ndvi_files[0])
+        self.ds_ndvi2, self.arr_ndvi2 = readraster(ndvi_files[1])
+        self.ds_ndvi3, self.arr_ndvi3 = readraster(ndvi_files[2])
+
+        # Load emissivity data
+        self.ds_emiss1, self.arr_emiss1 = readraster(emissivity_files[0])
+        self.ds_emiss2, self.arr_emiss2 = readraster(emissivity_files[1])
+        self.ds_emiss3, self.arr_emiss3 = readraster(emissivity_files[2])
+
+        # Clean the data
+        self._clean_data()
+        self.performChecks()
+
+    def _clean_data(self):
+        """Clean and validate the input data"""
+        print("Cleaning and validating data...")
+
+        # Clean LST data - set reasonable bounds for LST (typically -50 to 60°C for Earth)
+        for arr in [self.arr_lst1, self.arr_lst2, self.arr_lst3]:
+            arr[arr < -50] = np.nan
+            arr[arr > 60] = np.nan
+
+        # Clean NDVI data (-1 to 1)
+        for arr in [self.arr_ndvi1, self.arr_ndvi2, self.arr_ndvi3]:
+            arr[arr < -1] = np.nan
+            arr[arr > 1] = np.nan
+
+        # Clean emissivity data (0 to 1)
+        for arr in [self.arr_emiss1, self.arr_emiss2, self.arr_emiss3]:
+            arr[arr < 0] = np.nan
+            arr[arr > 1] = np.nan
+
+        # Clean land use data (should be integer classes)
+        for arr in [self.arr_lu1, self.arr_lu2, self.arr_lu3]:
+            arr[~np.isfinite(arr)] = 0  # Set non-finite values to 0 (background)
+            arr = arr.astype(np.int32)
+
+    def performChecks(self):
+        print("Checking the size of input rasters...")
+        datasets = [
+            self.ds_lst1, self.ds_lst2, self.ds_lst3,
+            self.ds_lu1, self.ds_lu2, self.ds_lu3,
+            self.ds_ndvi1, self.ds_ndvi2, self.ds_ndvi3,
+            self.ds_emiss1, self.ds_emiss2, self.ds_emiss3
+        ]
+
+        rows = [ds.RasterYSize for ds in datasets]
+        cols = [ds.RasterXSize for ds in datasets]
+
+        if identicalList(rows) and identicalList(cols):
+            print("All raster sizes matched.")
+            self.row, self.col = rows[0], cols[0]
+        else:
+            raise ValueError("Input raster files have different dimensions.")
+
+        print("\nChecking data ranges...")
+        for year, arr in zip(['2015', '2020', '2025'], [self.arr_lst1, self.arr_lst2, self.arr_lst3]):
+            valid_mask = ~np.isnan(arr)
+            if np.any(valid_mask):
+                print(f"LST {year}: {np.nanmin(arr):.2f} to {np.nanmax(arr):.2f}°C, "
+                      f"Mean={np.nanmean(arr):.2f}°C, Valid pixels={np.sum(valid_mask)}")
+            else:
+                print(f"LST {year}: No valid data")
+
+
+class LSTFactors:
+    def __init__(self, *args):
+        self.factors = {}
+        self.factors_ds = {}
+        self.nFactors = len(args)
+        factor_names = [
+            'amenity', 'building_density', 'cbd_distance', 'commercial',
+            'industrial', 'ntl', 'population', 'restricted',
+            'road_density', 'road_distance', 'slope'
+        ]
+
+        for n, file in enumerate(args, 1):
+            self.factors_ds[n], self.factors[n] = readraster(file)
+            # Clean factor data
+            self.factors[n] = self._clean_factor(self.factors[n], factor_names[n - 1])
+            print(
+                f"Loaded factor {n}: {factor_names[n - 1]} - range: {np.nanmin(self.factors[n]):.3f} to {np.nanmax(self.factors[n]):.3f}")
+
+        self.performChecks()
+
+    def _clean_factor(self, factor_data, factor_name):
+        """Clean factor data based on expected ranges"""
+        # Replace extreme values with NaN
+        factor_data = np.where(factor_data < -1e10, np.nan, factor_data)
+        factor_data = np.where(factor_data > 1e10, np.nan, factor_data)
+
+        # Factor-specific cleaning
+        if factor_name in ['amenity', 'commercial', 'industrial']:
+            factor_data = np.where(factor_data < 0, 0, factor_data)
+        elif factor_name == 'building_density':
+            factor_data = np.where(factor_data < 0, 0, factor_data)
+            # Normalize very large values
+            if np.nanmax(factor_data) > 10000:
+                factor_data = factor_data / 1000
+        elif factor_name == 'population':
+            factor_data = np.where(factor_data < 0, 0, factor_data)
+        elif factor_name == 'slope':
+            factor_data = np.where(factor_data < 0, 0, factor_data)
+            factor_data = np.where(factor_data > 90, 90, factor_data)
+
+        return factor_data
+
+    def performChecks(self):
+        print("\nChecking the size of input factors...")
+        rows = []
+        cols = []
+        for n in range(1, self.nFactors + 1):
+            rows.append(self.factors_ds[n].RasterYSize)
+            cols.append(self.factors_ds[n].RasterXSize)
+
+        if identicalList(rows) and identicalList(cols):
+            print("All factors have same row and column values.")
+            self.row = rows[0]
+            self.col = cols[0]
+        else:
+            raise ValueError("Input factors have different dimensions.")
+
+
+class LSTDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+# ============================================================================
+# Enhanced Memory-Efficient Transformer Components
+# ============================================================================
+
+class PositionalEncoding2D(nn.Module):
+    def __init__(self, channels, height, width):
+        super(PositionalEncoding2D, self).__init__()
+        self.channels = channels
+        self.height = height
+        self.width = width
+
+        pe = torch.zeros(channels, height, width)
+        y_pos = torch.arange(0, height).unsqueeze(1).repeat(1, width).float()
+        x_pos = torch.arange(0, width).unsqueeze(0).repeat(height, 1).float()
+
+        y_pos = 2 * (y_pos / height) - 1
+        x_pos = 2 * (x_pos / width) - 1
+
+        num_bands = channels // 4
+        if num_bands < 1:
+            num_bands = 1
+
+        div_term = torch.exp(torch.arange(0, num_bands).float() *
+                             (-math.log(10000.0) / num_bands))
+
+        pos_idx = 0
+        for i in range(0, channels, 4):
+            if pos_idx < num_bands:
+                if i < channels:
+                    pe[i, :, :] = torch.sin(y_pos * div_term[pos_idx])
+                if i + 1 < channels:
+                    pe[i + 1, :, :] = torch.cos(y_pos * div_term[pos_idx])
+                if i + 2 < channels:
+                    pe[i + 2, :, :] = torch.sin(x_pos * div_term[pos_idx])
+                if i + 3 < channels:
+                    pe[i + 3, :, :] = torch.cos(x_pos * div_term[pos_idx])
+                pos_idx += 1
+
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :, :x.size(2), :x.size(3)]
+
+
+class MemoryEfficientSpatialAttention(nn.Module):
+    def __init__(self, channels, num_heads=4, reduction_ratio=4):
+        super(MemoryEfficientSpatialAttention, self).__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.reduction_ratio = reduction_ratio
+
+        assert channels % num_heads == 0, "channels must be divisible by num_heads"
+
+        self.query = nn.Conv2d(channels, channels, kernel_size=1)
+        self.key = nn.Conv2d(channels, channels, kernel_size=1)
+        self.value = nn.Conv2d(channels, channels, kernel_size=1)
+        self.out = nn.Conv2d(channels, channels, kernel_size=1)
+
+        self.scale = self.head_dim ** -0.5
+
+        self.spatial_reduction = nn.Conv2d(channels, channels, kernel_size=reduction_ratio,
+                                           stride=reduction_ratio, groups=channels)
+        self.spatial_upsample = nn.Upsample(scale_factor=reduction_ratio, mode='bilinear')
+
+        self.attention_weights = None
+
+    def forward(self, x):
+        batch, channels, height, width = x.shape
+
+        reduced_height = height // self.reduction_ratio
+        reduced_width = width // self.reduction_ratio
+
+        x_reduced = self.spatial_reduction(x)
+
+        q = self.query(x)
+        k = self.key(x_reduced)
+        v = self.value(x_reduced)
+
+        q = q.view(batch, self.num_heads, self.head_dim, height * width)
+        k = k.view(batch, self.num_heads, self.head_dim, reduced_height * reduced_width)
+        v = v.view(batch, self.num_heads, self.head_dim, reduced_height * reduced_width)
+
+        q = q.transpose(2, 3)
+        k = k.transpose(2, 3)
+        v = v.transpose(2, 3)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+
+        try:
+            self.attention_weights = attn.detach().cpu().numpy()
+        except Exception:
+            self.attention_weights = None
+
+        out = torch.matmul(attn, v)
+        out = out.transpose(2, 3).contiguous()
+        out = out.view(batch, channels, height, width)
+        out = self.out(out)
+
+        return out
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, channels, num_heads=4, mlp_ratio=2.0, dropout=0.1, reduction_ratio=4):
+        super(TransformerBlock, self).__init__()
+
+        self.norm1 = nn.BatchNorm2d(channels)
+        self.attention = MemoryEfficientSpatialAttention(channels, num_heads, reduction_ratio)
+        self.dropout1 = nn.Dropout2d(dropout)
+
+        self.norm2 = nn.BatchNorm2d(channels)
+        mlp_hidden = int(channels * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, mlp_hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(mlp_hidden, channels, kernel_size=1),
+            nn.Dropout2d(dropout)
+        )
+
+    def forward(self, x):
+        residual = x
+        x = self.norm1(x)
+        x = self.attention(x)
+        x = self.dropout1(x)
+        x = x + residual
+
+        residual = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = x + residual
+        return x
+
+
+class SpatialTransformer(nn.Module):
+    def __init__(self, in_channels, out_channels, num_layers=2, num_heads=4,
+                 mlp_ratio=2.0, dropout=0.1, patch_size=64, reduction_ratio=4):
+        super(SpatialTransformer, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.patch_size = patch_size
+
+        self.input_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.pos_encoding = PositionalEncoding2D(out_channels, patch_size, patch_size)
+
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(out_channels, num_heads, mlp_ratio, dropout, reduction_ratio)
+            for _ in range(num_layers)
+        ])
+
+        self.norm = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.pos_encoding(x)
+
+        for block in self.transformer_blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        return x
+
+    def get_attention_weights(self):
+        attention_weights = {}
+        for idx, block in enumerate(self.transformer_blocks):
+            if hasattr(block.attention, 'attention_weights') and block.attention.attention_weights is not None:
+                attention_weights[f'layer_{idx}'] = block.attention.attention_weights
+        return attention_weights
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResidualBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.shortcut is not None:
+            identity = self.shortcut(identity)
+        out = out + identity
+        out = self.relu(out)
+        return out
+
+
+class EnhancedResidualBlock(nn.Module):
+    """Enhanced residual block with squeeze-and-excitation and better initialization"""
+
+    def __init__(self, in_channels, out_channels, reduction=16):
+        super(EnhancedResidualBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        # Squeeze-and-Excitation block
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(out_channels, out_channels // reduction, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels // reduction, out_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        # Apply SE
+        se_weight = self.se(out)
+        out = out * se_weight
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class AdvancedLSTResNetTransformerModel(nn.Module):
+    def __init__(self, input_channels, patch_size=64):
+        super(AdvancedLSTResNetTransformerModel, self).__init__()
+        self.patch_size = patch_size
+
+        # Enhanced feature extraction with more channels
+        self.initial_conv = nn.Sequential(
+            nn.Conv2d(input_channels, 64, kernel_size=7, padding=3, stride=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        # Enhanced residual blocks with squeeze-and-excitation
+        self.res_block1 = EnhancedResidualBlock(64, 128)
+        self.res_block2 = EnhancedResidualBlock(128, 128)
+        self.res_block3 = EnhancedResidualBlock(128, 256)
+        self.res_block4 = EnhancedResidualBlock(256, 256)
+
+        # First transformer with more capacity
+        self.transformer1 = SpatialTransformer(
+            in_channels=256,
+            out_channels=256,
+            num_layers=3,  # Increased layers
+            num_heads=8,  # More heads
+            mlp_ratio=4.0,  # Larger MLP
+            dropout=0.1,
+            patch_size=patch_size // 4,  # Adjusted for downsampling
+            reduction_ratio=4
+        )
+
+        # More residual blocks
+        self.res_block5 = EnhancedResidualBlock(256, 128)
+        self.res_block6 = EnhancedResidualBlock(128, 128)
+        self.res_block7 = EnhancedResidualBlock(128, 64)
+        self.res_block8 = EnhancedResidualBlock(64, 64)
+
+        # Second transformer
+        self.transformer2 = SpatialTransformer(
+            in_channels=64,
+            out_channels=64,
+            num_layers=2,
+            num_heads=8,
+            mlp_ratio=4.0,
+            dropout=0.1,
+            patch_size=patch_size // 4,
+            reduction_ratio=4
+        )
+
+        # Final residual blocks
+        self.res_block9 = EnhancedResidualBlock(64, 32)
+        self.res_block10 = EnhancedResidualBlock(32, 32)
+
+        # Advanced thermal regulation with multi-scale features - FIXED DIMENSIONS
+        self.thermal_regulation = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(32, 16),  # FIXED: Changed from 32 to match input
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(16, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Tanh()
+        )
+
+        # Multi-scale feature fusion
+        self.feature_fusion = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.Conv2d(16, 8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU()
+        )
+
+        # Final upsampling and output
+        self.upsample = nn.Sequential(
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=True),
+            nn.Conv2d(8, 8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(),
+            nn.Conv2d(8, 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(4),
+            nn.ReLU(),
+            nn.Conv2d(4, 1, kernel_size=1)
+        )
+
+        # Skip connection from initial features
+        self.skip_conv = nn.Conv2d(64, 8, kernel_size=1)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # Store original for skip connection
+        x_original = x
+
+        # Initial feature extraction with downsampling
+        x = self.initial_conv(x)
+        skip_features = self.skip_conv(x)
+
+        # Enhanced residual blocks
+        x = self.res_block1(x)
+        x = self.res_block2(x)
+        x = self.res_block3(x)
+        x = self.res_block4(x)
+
+        # First transformer
+        x = self.transformer1(x)
+
+        # More residual blocks
+        x = self.res_block5(x)
+        x = self.res_block6(x)
+        x = self.res_block7(x)
+        x = self.res_block8(x)
+
+        # Second transformer
+        x = self.transformer2(x)
+
+        # Final residual blocks
+        x = self.res_block9(x)
+        x = self.res_block10(x)
+
+        # Apply thermal regulation BEFORE feature fusion
+        thermal_factor = self.thermal_regulation(x)
+
+        # Feature fusion
+        x = self.feature_fusion(x)
+
+        # Apply thermal adjustment
+        x = x * (1 + thermal_factor.view(-1, 1, 1, 1) * 0.1)
+
+        # Add skip connection
+        x = x + skip_features
+
+        # Final upsampling to original patch size
+        x = self.upsample(x)
+
+        return x
+
+
+class LSTSimulator:
+    def __init__(self, lst_data, lst_factors, patch_size=64):
+        self.lst_data = lst_data
+        self.factors = lst_factors
+        self.patch_size = patch_size
+        self.model = None
+        self.last_eval_metrics = None
+        self.attention_history = []
+        self.experiment_results = {}
+        self.best_val_loss = float('inf')
+        self.patience_counter = 0
+        self.max_patience = 15
+
+        # LST-specific analysis
+        self.lst_statistics = self._analyze_lst_statistics()
+        self.temporal_trends = self._analyze_temporal_trends()
+        self.urban_heat_island = self._analyze_urban_heat_island()
+
+        print("\n=== LST STATISTICAL ANALYSIS ===")
+        for year in ['2015', '2020', '2025']:
+            stats = self.lst_statistics[year]
+            print(f"LST {year}: Mean={stats['mean']:.2f}°C, Std={stats['std']:.2f}, "
+                  f"Range={stats['min']:.2f} to {stats['max']:.2f}°C")
+
+        if 'warming_rate' in self.temporal_trends:
+            print(f"Average warming rate: {self.temporal_trends['warming_rate']:.4f}°C/year")
+
+    def _analyze_lst_statistics(self):
+        """Analyze basic statistics of LST data"""
+        stats = {}
+        for year, arr in zip(['2015', '2020', '2025'],
+                             [self.lst_data.arr_lst1, self.lst_data.arr_lst2, self.lst_data.arr_lst3]):
+            valid_mask = ~np.isnan(arr)
+            if np.any(valid_mask):
+                valid_data = arr[valid_mask]
+                stats[year] = {
+                    'mean': np.mean(valid_data),
+                    'std': np.std(valid_data),
+                    'min': np.min(valid_data),
+                    'max': np.max(valid_data),
+                    'median': np.median(valid_data),
+                    'valid_pixels': np.sum(valid_mask)
+                }
+            else:
+                stats[year] = {'mean': 0, 'std': 0, 'min': 0, 'max': 0, 'median': 0, 'valid_pixels': 0}
+        return stats
+
+    def _analyze_temporal_trends(self):
+        """Analyze temporal trends in LST"""
+        trends = {}
+
+        try:
+            # Calculate warming rates between periods
+            if (self.lst_statistics['2015']['valid_pixels'] > 0 and
+                    self.lst_statistics['2020']['valid_pixels'] > 0):
+                warming_2015_2020 = (self.lst_statistics['2020']['mean'] - self.lst_statistics['2015']['mean']) / 5
+                trends['warming_2015_2020'] = warming_2015_2020
+
+            if (self.lst_statistics['2020']['valid_pixels'] > 0 and
+                    self.lst_statistics['2025']['valid_pixels'] > 0):
+                warming_2020_2025 = (self.lst_statistics['2025']['mean'] - self.lst_statistics['2020']['mean']) / 5
+                trends['warming_2020_2025'] = warming_2020_2025
+
+            # Calculate average warming rate
+            warming_rates = [trends.get('warming_2015_2020', 0), trends.get('warming_2020_2025', 0)]
+            valid_rates = [r for r in warming_rates if r != 0]
+            if valid_rates:
+                trends['warming_rate'] = np.mean(valid_rates)
+
+        except (KeyError, TypeError):
+            trends['warming_rate'] = 0.0
+
+        return trends
+
+    def _analyze_urban_heat_island(self):
+        """Analyze urban heat island effect"""
+        uhi_analysis = {}
+
+        for year, lst_arr, lu_arr in zip(['2015', '2020', '2025'],
+                                         [self.lst_data.arr_lst1, self.lst_data.arr_lst2, self.lst_data.arr_lst3],
+                                         [self.lst_data.arr_lu1, self.lst_data.arr_lu2, self.lst_data.arr_lu3]):
+            # Calculate LST by land use class
+            lst_by_class = {}
+            for lu_class in [1, 2, 3, 4]:  # Assuming 1:urban, 2:vegetation, 3:water, 4:other
+                mask = (lu_arr == lu_class) & ~np.isnan(lst_arr)
+                if np.any(mask):
+                    lst_by_class[lu_class] = np.mean(lst_arr[mask])
+                else:
+                    lst_by_class[lu_class] = np.nan
+
+            uhi_analysis[year] = lst_by_class
+
+            # Calculate UHI intensity (urban - vegetation)
+            if (1 in lst_by_class and 2 in lst_by_class and
+                    not np.isnan(lst_by_class[1]) and not np.isnan(lst_by_class[2])):
+                uhi_intensity = lst_by_class[1] - lst_by_class[2]
+                uhi_analysis[year]['uhi_intensity'] = uhi_intensity
+
+        return uhi_analysis
+
+    def prepare_training_data(self):
+        print("Preparing training data for LST simulation...")
+
+        all_X = []
+        all_y = []
+
+        # Prepare data for each time period
+        time_periods = [
+            (self.lst_data.arr_lu1, self.lst_data.arr_ndvi1, self.lst_data.arr_emiss1, self.lst_data.arr_lst1, "2015"),
+            (self.lst_data.arr_lu2, self.lst_data.arr_ndvi2, self.lst_data.arr_emiss2, self.lst_data.arr_lst2, "2020"),
+            (self.lst_data.arr_lu3, self.lst_data.arr_ndvi3, self.lst_data.arr_emiss3, self.lst_data.arr_lst3, "2025")
+        ]
+
+        for lu_arr, ndvi_arr, emiss_arr, lst_arr, period_name in time_periods:
+            # Create enhanced feature stack with derived features
+            input_stack = self._create_enhanced_features(lu_arr, ndvi_arr, emiss_arr)
+            target_lst = np.expand_dims(lst_arr, axis=0)
+
+            # Normalize data
+            input_stack = self.normalize_data(input_stack)
+            target_lst = self.normalize_target(target_lst)
+
+            # Create patches
+            X_patches, y_patches = self.create_patches(input_stack, target_lst)
+
+            if X_patches.size > 0:
+                all_X.append(X_patches)
+                all_y.append(y_patches)
+                print(f"  {period_name}: {len(X_patches)} patches")
+
+        if len(all_X) == 0:
+            raise ValueError("No patches were created. Check inputs and patch size.")
+
+        X_patches = np.concatenate(all_X, axis=0)
+        y_patches = np.concatenate(all_y, axis=0)
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_patches, y_patches, test_size=0.2, random_state=42, stratify=None
+        )
+
+        print(f"Total training samples: {len(X_train)}")
+        print(f"Total validation samples: {len(X_val)}")
+
+        return X_train, X_val, y_train, y_val
+
+    def _create_enhanced_features(self, lu_arr, ndvi_arr, emiss_arr):
+        """Create enhanced feature stack with derived features"""
+        input_layers = []
+
+        # Basic features
+        input_layers.append(lu_arr)
+        input_layers.append(ndvi_arr)
+        input_layers.append(emiss_arr)
+
+        # Add all other factors
+        for i in range(1, self.factors.nFactors + 1):
+            input_layers.append(self.factors.factors[i])
+
+        # Create derived features
+        # 1. Urban intensity (combination of building density and land use)
+        if 2 in self.factors.factors:  # building density
+            urban_intensity = self.factors.factors[2] * (lu_arr == 1).astype(np.float32)
+            input_layers.append(urban_intensity)
+
+        # 2. Vegetation cooling effect
+        vegetation_cooling = ndvi_arr * (lu_arr == 2).astype(np.float32)
+        input_layers.append(vegetation_cooling)
+
+        # 3. Distance-based features (inverse of distance)
+        if 3 in self.factors.factors:  # CBD distance
+            cbd_inverse = 1.0 / (self.factors.factors[3] + 1e-6)
+            input_layers.append(cbd_inverse)
+
+        if 10 in self.factors.factors:  # road distance
+            road_inverse = 1.0 / (self.factors.factors[10] + 1e-6)
+            input_layers.append(road_inverse)
+
+        # 4. Interaction terms
+        if 2 in self.factors.factors and 6 in self.factors.factors:  # building density * NTL
+            urban_heat = self.factors.factors[2] * self.factors.factors[6]
+            input_layers.append(urban_heat)
+
+        # 5. Elevation-based features (if slope available)
+        if 11 in self.factors.factors:  # slope
+            elevation_effect = np.exp(-self.factors.factors[11] / 45.0)  # Exponential decay with slope
+            input_layers.append(elevation_effect)
+
+        input_stack = np.stack(input_layers, axis=0)
+        print(f"Created enhanced feature stack with {input_stack.shape[0]} channels")
+
+        return input_stack
+
+    def normalize_data(self, data):
+        """Enhanced normalization with robust scaling"""
+        normalized_data = np.zeros_like(data, dtype=np.float32)
+        for i in range(data.shape[0]):
+            channel_data = data[i].astype(np.float32)
+            valid_mask = ~np.isnan(channel_data)
+            if np.any(valid_mask):
+                valid_data = channel_data[valid_mask]
+
+                # Use robust scaling (median and IQR) for better outlier handling
+                median = np.median(valid_data)
+                q75, q25 = np.percentile(valid_data, [75, 25])
+                iqr = q75 - q25
+
+                if iqr > 0:
+                    normalized_data[i] = (channel_data - median) / iqr
+                else:
+                    # Fallback to standard normalization
+                    mean = np.mean(valid_data)
+                    std = np.std(valid_data)
+                    if std > 0:
+                        normalized_data[i] = (channel_data - mean) / std
+                    else:
+                        normalized_data[i] = channel_data - mean
+
+                # Fill NaN with 0 (median/mean after normalization)
+                normalized_data[i][~valid_mask] = 0
+            else:
+                normalized_data[i] = channel_data
+        return normalized_data
+
+    def normalize_target(self, target):
+        """Enhanced target normalization"""
+        normalized_target = np.zeros_like(target, dtype=np.float32)
+        for i in range(target.shape[0]):
+            channel_data = target[i].astype(np.float32)
+            valid_mask = ~np.isnan(channel_data)
+            if np.any(valid_mask):
+                valid_data = channel_data[valid_mask]
+
+                # Use median and IQR for robust scaling
+                self.lst_median = np.median(valid_data)
+                q75, q25 = np.percentile(valid_data, [75, 25])
+                self.lst_iqr = q75 - q25
+
+                if self.lst_iqr > 0:
+                    normalized_target[i] = (channel_data - self.lst_median) / self.lst_iqr
+                else:
+                    # Fallback to standard normalization
+                    self.lst_mean = np.mean(valid_data)
+                    self.lst_std = np.std(valid_data)
+                    if self.lst_std > 0:
+                        normalized_target[i] = (channel_data - self.lst_mean) / self.lst_std
+                    else:
+                        normalized_target[i] = channel_data - self.lst_mean
+
+                normalized_target[i][~valid_mask] = 0
+            else:
+                normalized_target[i] = channel_data
+        return normalized_target
+
+    def denormalize_target(self, normalized_target):
+        """Denormalize predicted LST values back to original scale"""
+        if hasattr(self, 'lst_median') and hasattr(self, 'lst_iqr') and self.lst_iqr > 0:
+            return normalized_target * self.lst_iqr + self.lst_median
+        elif hasattr(self, 'lst_mean') and hasattr(self, 'lst_std'):
+            return normalized_target * self.lst_std + self.lst_mean
+        else:
+            print("Warning: LST normalization parameters not found. Returning raw values.")
+            return normalized_target
+
+    def create_patches(self, input_data, target_data):
+        patches = []
+        target_patches = []
+        num_patches_x = self.lst_data.row // self.patch_size
+        num_patches_y = self.lst_data.col // self.patch_size
+
+        print(f"  Creating patches from {num_patches_x}x{num_patches_y} grid...")
+
+        for i in range(num_patches_x):
+            for j in range(num_patches_y):
+                patch = input_data[:,
+                        i * self.patch_size:(i + 1) * self.patch_size,
+                        j * self.patch_size:(j + 1) * self.patch_size
+                        ]
+                target_patch = target_data[:,
+                               i * self.patch_size:(i + 1) * self.patch_size,
+                               j * self.patch_size:(j + 1) * self.patch_size
+                               ]
+
+                # Enhanced patch validation with multiple criteria
+                valid_ratio = np.sum(~np.isnan(target_patch)) / target_patch.size
+                if valid_ratio > 0.4:  # Slightly higher threshold for better quality
+                    # Check for sufficient variance in the target
+                    valid_target_data = target_patch[~np.isnan(target_patch)]
+                    if len(valid_target_data) > 10:
+                        target_variance = np.var(valid_target_data)
+                        if target_variance > 0.01:  # Minimum variance threshold
+                            # Replace any remaining NaN with 0
+                            patch[np.isnan(patch)] = 0
+                            target_patch[np.isnan(target_patch)] = 0
+
+                            patches.append(patch)
+                            target_patches.append(target_patch)
+
+        print(f"  Created {len(patches)} high-quality patches (threshold: >40% valid data with variance)")
+
+        if len(patches) == 0:
+            return np.empty((0, input_data.shape[0], self.patch_size, self.patch_size), dtype=np.float32), \
+                np.empty((0, 1, self.patch_size, self.patch_size), dtype=np.float32)
+
+        return np.array(patches, dtype=np.float32), np.array(target_patches, dtype=np.float32)
+
+    def create_patches_for_prediction(self, input_data):
+        patches = []
+        positions = []
+        num_patches_x = self.lst_data.row // self.patch_size
+        num_patches_y = self.lst_data.col // self.patch_size
+
+        for i in range(num_patches_x):
+            for j in range(num_patches_y):
+                patch = input_data[:,
+                        i * self.patch_size:(i + 1) * self.patch_size,
+                        j * self.patch_size:(j + 1) * self.patch_size
+                        ]
+                # Replace NaN with 0
+                patch[np.isnan(patch)] = 0
+                patches.append(patch)
+                positions.append((i, j))
+
+        return np.array(patches, dtype=np.float32), positions, num_patches_x, num_patches_y
+
+    def build_model(self):
+        # Input channels: basic features + derived features
+        basic_channels = 3 + self.factors.nFactors
+        derived_channels = 6  # urban_intensity, vegetation_cooling, cbd_inverse, road_inverse, urban_heat, elevation_effect
+        input_channels = basic_channels + derived_channels
+
+        self.model = AdvancedLSTResNetTransformerModel(input_channels, self.patch_size).to(device)
+        print(f"Enhanced model built with {input_channels} input channels")
+
+        # Print model size
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Total parameters: {total_params:,}")
+
+        # Enhanced loss function with multiple components
+        self.criterion_mse = nn.MSELoss()
+        self.criterion_mae = nn.L1Loss()
+        self.criterion_huber = nn.HuberLoss(delta=0.5)  # Reduced delta for better accuracy
+
+        # Enhanced optimizer with better settings
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=0.0005,  # Reduced learning rate for better convergence
+            weight_decay=1e-5,
+            betas=(0.9, 0.999)
+        )
+
+        # Enhanced learning rate scheduler
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=0.005,  # Adjusted max_lr
+            epochs=100,
+            steps_per_epoch=1,
+            pct_start=0.1,
+            div_factor=10.0,
+            final_div_factor=100.0
+        )
+
+    def train(self, epochs=100, batch_size=8):
+        X_train, X_val, y_train, y_val = self.prepare_training_data()
+
+        train_dataset = LSTDataset(X_train, y_train)
+        val_dataset = LSTDataset(X_val, y_val)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                                  pin_memory=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                pin_memory=True, num_workers=0)
+
+        history = {
+            'train_loss': [], 'val_loss': [],
+            'train_mae': [], 'val_mae': [],
+            'train_rmse': [], 'val_rmse': [],
+            'learning_rate': []
+        }
+
+        for epoch in range(epochs):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            self.model.train()
+            train_loss = 0.0
+            train_mae = 0.0
+            train_rmse = 0.0
+            train_batches = 0
+
+            for batch_idx, (batch_X, batch_y) in enumerate(train_loader):
+                batch_X, batch_y = batch_X.to(device, non_blocking=True), batch_y.to(device, non_blocking=True)
+
+                self.optimizer.zero_grad()
+                outputs = self.model(batch_X)
+
+                # Enhanced combined loss function with better weighting
+                mse_loss = self.criterion_mse(outputs, batch_y)
+                mae_loss = self.criterion_mae(outputs, batch_y)
+                huber_loss = self.criterion_huber(outputs, batch_y)
+
+                # Weighted combination - prioritizing MAE and Huber for better accuracy
+                loss = 0.3 * mse_loss + 0.4 * mae_loss + 0.3 * huber_loss  # Adjusted weights
+
+                loss.backward()
+
+                # Gradient clipping with smaller norm
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)  # Reduced from 1.0
+                self.optimizer.step()
+
+                train_loss += loss.item()
+                train_mae += mae_loss.item()
+                train_rmse += torch.sqrt(mse_loss).item()
+                train_batches += 1
+
+                if batch_idx % 20 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # Update learning rate
+            current_lr = self.optimizer.param_groups[0]['lr']
+            history['learning_rate'].append(current_lr)
+
+            self.model.eval()
+            val_loss = 0.0
+            val_mae = 0.0
+            val_rmse = 0.0
+            val_batches = 0
+
+            with torch.no_grad():
+                for batch_X, batch_y in val_loader:
+                    batch_X, batch_y = batch_X.to(device, non_blocking=True), batch_y.to(device, non_blocking=True)
+                    outputs = self.model(batch_X)
+
+                    mse_loss = self.criterion_mse(outputs, batch_y)
+                    mae_loss = self.criterion_mae(outputs, batch_y)
+                    huber_loss = self.criterion_huber(outputs, batch_y)
+
+                    loss = 0.3 * mse_loss + 0.4 * mae_loss + 0.3 * huber_loss
+
+                    val_loss += loss.item()
+                    val_mae += mae_loss.item()
+                    val_rmse += torch.sqrt(mse_loss).item()
+                    val_batches += 1
+
+            train_loss = train_loss / train_batches if train_batches > 0 else 0.0
+            train_mae = train_mae / train_batches if train_batches > 0 else 0.0
+            train_rmse = train_rmse / train_batches if train_batches > 0 else 0.0
+            val_loss = val_loss / val_batches if val_batches > 0 else 0.0
+            val_mae = val_mae / val_batches if val_batches > 0 else 0.0
+            val_rmse = val_rmse / val_batches if val_batches > 0 else 0.0
+
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            history['train_mae'].append(train_mae)
+            history['val_mae'].append(val_mae)
+            history['train_rmse'].append(train_rmse)
+            history['val_rmse'].append(val_rmse)
+
+            print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f}')
+            print(f'  Train - Loss: {train_loss:.4f}, MAE: {train_mae:.4f}, RMSE: {train_rmse:.4f}')
+            print(f'  Val   - Loss: {val_loss:.4f}, MAE: {val_mae:.4f}, RMSE: {val_rmse:.4f}')
+
+            # Model checkpointing without early stopping
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': val_loss,
+                    'metrics': {'mae': val_mae, 'rmse': val_rmse}
+                }, 'best_lst_model.pth')
+                print(f'  ↳ New best model saved! (Val Loss: {val_loss:.4f})')
+
+            if (epoch + 1) % 25 == 0:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': train_loss,
+                }, f'lst_checkpoint_epoch_{epoch + 1}.pth')
+
+        # Load best model for final use
+        if os.path.exists('best_lst_model.pth'):
+            checkpoint = torch.load('best_lst_model.pth')
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded best model from epoch {checkpoint['epoch'] + 1} with val loss {checkpoint['loss']:.4f}")
+        else:
+            print("No best model found, using final model")
+
+        return history
+
+    def predict_lst(self, landuse_map, ndvi_map, emissivity_map, apply_thermal_constraints=True,
+                    is_future_scenario=False):
+        """Predict LST for given input maps with enhanced urban expansion consideration"""
+        # Create enhanced feature stack
+        input_stack = self._create_enhanced_features(landuse_map, ndvi_map, emissivity_map)
+        input_stack = self.normalize_data(input_stack)
+
+        patches, positions, num_patches_x, num_patches_y = self.create_patches_for_prediction(input_stack)
+
+        if patches.size == 0:
+            raise ValueError("No patches created for prediction.")
+
+        self.model.eval()
+        predictions = []
+
+        with torch.no_grad():
+            for i in range(0, len(patches), 8):
+                batch = torch.FloatTensor(patches[i:i + 8]).to(device)
+                pred = self.model(batch)
+                predictions.append(pred.cpu().numpy())
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        predictions = np.concatenate(predictions, axis=0)
+        lst_prediction_normalized = self.reconstruct_from_patches(predictions, positions, num_patches_x, num_patches_y)
+
+        # Denormalize to get actual LST values
+        lst_prediction = self.denormalize_target(lst_prediction_normalized)
+
+        if apply_thermal_constraints:
+            lst_prediction = self._apply_thermal_constraints(lst_prediction, landuse_map, ndvi_map, is_future_scenario)
+
+        return lst_prediction
+
+    def _apply_thermal_constraints(self, lst_prediction, landuse_map, ndvi_map, is_future_scenario=False):
+        """Apply enhanced physical constraints to LST predictions with urban expansion awareness"""
+        from scipy import ndimage
+
+        # 1. Enhanced Urban Heat Island effect for future scenarios
+        urban_mask = (landuse_map == 1)
+        vegetation_mask = (landuse_map == 2)  # Assuming 2 is vegetation
+        water_mask = (landuse_map == 3)  # Assuming 3 is water
+
+        # 2. Enhanced NDVI-based cooling with saturation
+        ndvi_effect = -ndvi_map * 2.5  # Reduced effect to prevent over-cooling
+        ndvi_effect = np.clip(ndvi_effect, -5, 0)  # Limit cooling effect
+
+        # 3. Enhanced UHI effect for future urban expansion - INCREASED WARMING
+        if is_future_scenario:
+            # Calculate urban expansion intensity
+            urban_expansion_intensity = self._calculate_urban_expansion_intensity(landuse_map)
+
+            # Apply stronger UHI effect for future urban areas - INCREASED FROM 3.0 TO 4.5
+            uhi_enhancement = urban_expansion_intensity * 8.5  # Enhanced UHI effect
+            print(f"  Applying UHI enhancement for future scenario: max {np.max(uhi_enhancement):.2f}°C")
+        else:
+            uhi_enhancement = np.zeros_like(lst_prediction)
+
+        # 4. Advanced smoothing with edge preservation
+        lst_smoothed = ndimage.gaussian_filter(lst_prediction, sigma=0.8)
+
+        # 5. Adaptive blending based on urban density
+        urban_density = self._calculate_urban_density(landuse_map)
+        alpha = 0.15 + 0.1 * urban_density  # More smoothing in dense urban areas
+        alpha = np.clip(alpha, 0.1, 0.3)
+
+        constrained_lst = lst_prediction * (1 - alpha) + lst_smoothed * alpha
+
+        # 6. Apply NDVI cooling effect
+        constrained_lst = constrained_lst + ndvi_effect
+
+        # 7. Enhanced UHI application with spatial coherence
+        constrained_lst[urban_mask] = constrained_lst[urban_mask] + uhi_enhancement[urban_mask]
+
+        # 8. Ensure realistic temperature ranges with climate context
+        min_temp = max(np.nanmin(self.lst_data.arr_lst1) - 3, 15)  # Reasonable minimum
+        max_temp = min(np.nanmax(self.lst_data.arr_lst3) + 10, 50)  # Reasonable maximum
+        constrained_lst = np.clip(constrained_lst, min_temp, max_temp)
+
+        # 9. Apply temporal warming trend for future scenarios - INCREASED WARMING
+        if is_future_scenario:
+            warming_trend = self._calculate_warming_trend_addition()
+            constrained_lst = constrained_lst + warming_trend
+            print(f"  Applied warming trend: +{warming_trend:.2f}°C")
+
+        return constrained_lst
+
+    def _calculate_urban_expansion_intensity(self, landuse_map):
+        """Calculate intensity of urban expansion for enhanced UHI effect"""
+        # Use multiple factors for urban intensity
+        building_density = self.factors.factors[2]  # Assuming factor 2 is building density
+        population = self.factors.factors[7]  # Assuming factor 7 is population
+        ntl = self.factors.factors[6]  # Assuming factor 6 is NTL
+
+        # Normalize and combine factors
+        urban_intensity = np.zeros_like(landuse_map, dtype=np.float32)
+
+        if np.nanmax(building_density) > 0:
+            urban_intensity += building_density / np.nanmax(building_density)
+
+        if np.nanmax(population) > 0:
+            urban_intensity += population / np.nanmax(population)
+
+        if np.nanmax(ntl) > 0:
+            urban_intensity += ntl / np.nanmax(ntl)
+
+        # Normalize to 0-1 range
+        if np.nanmax(urban_intensity) > 0:
+            urban_intensity = urban_intensity / np.nanmax(urban_intensity)
+
+        # Enhance for urban areas only
+        urban_mask = (landuse_map == 1)
+        urban_intensity[~urban_mask] = 0
+
+        return urban_intensity
+
+    def _calculate_urban_density(self, landuse_map, kernel_size=5):
+        """Calculate local urban density for adaptive smoothing"""
+        from scipy import ndimage
+
+        urban_mask = (landuse_map == 1).astype(np.float32)
+        kernel = np.ones((kernel_size, kernel_size)) / (kernel_size * kernel_size)
+        urban_density = ndimage.convolve(urban_mask, kernel, mode='constant', cval=0.0)
+
+        return urban_density
+
+    def _calculate_warming_trend_addition(self):
+        """Calculate additional warming based on historical trends - INCREASED WARMING"""
+        if hasattr(self, 'temporal_trends') and 'warming_rate' in self.temporal_trends:
+            # Apply 10-year warming trend with acceleration factor - INCREASED ACCELERATION
+            historical_warming_rate = self.temporal_trends['warming_rate']
+            future_warming = historical_warming_rate * 10 * 1.5  # 10-year projection with 50% acceleration (was 20%)
+            return max(future_warming, 1.5)  # Minimum 1.5°C warming (was 0.8°C)
+        else:
+            # Default conservative warming - INCREASED
+            return 1.8  # 1.8°C default warming for future scenarios (was 1.2°C)
+
+    def reconstruct_from_patches(self, patches, positions, num_patches_x, num_patches_y):
+        reconstructed = np.zeros((self.lst_data.row, self.lst_data.col), dtype=np.float32)
+        for idx, (i, j) in enumerate(positions):
+            reconstructed[
+            i * self.patch_size:(i + 1) * self.patch_size,
+            j * self.patch_size:(j + 1) * self.patch_size
+            ] = patches[idx, 0]
+        return reconstructed
+
+    def evaluate(self, actual_lst, predicted_lst):
+        """Enhanced evaluation with additional metrics"""
+        print("\n=== ENHANCED EVALUATING LST MODEL ===")
+
+        # Create mask for valid pixels (non-NaN in both arrays)
+        valid_mask = ~np.isnan(actual_lst) & ~np.isnan(predicted_lst)
+
+        if np.sum(valid_mask) == 0:
+            raise ValueError("No valid pixels for evaluation.")
+
+        actual_flat = actual_lst[valid_mask].flatten()
+        predicted_flat = predicted_lst[valid_mask].flatten()
+
+        # Calculate regression metrics
+        mse = mean_squared_error(actual_flat, predicted_flat)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(actual_flat, predicted_flat)
+        r2 = r2_score(actual_flat, predicted_flat)
+
+        # Calculate additional metrics
+        bias = np.mean(predicted_flat - actual_flat)
+
+        # Calculate relative metrics
+        relative_mae = mae / np.mean(np.abs(actual_flat))
+        relative_rmse = rmse / np.mean(actual_flat)
+
+        # Calculate skill score (1 - MSE_model/MSE_climatology)
+        mse_climatology = np.mean((actual_flat - np.mean(actual_flat)) ** 2)
+        skill_score = 1 - (mse / mse_climatology) if mse_climatology > 0 else 0
+
+        print(f"\n=== ENHANCED LST EVALUATION RESULTS ===")
+        print(f"RMSE: {rmse:.3f}°C")
+        print(f"MAE: {mae:.3f}°C")
+        print(f"R² Score: {r2:.4f}")
+        print(f"Bias: {bias:.3f}°C")
+        print(f"Relative MAE: {relative_mae:.4f}")
+        print(f"Relative RMSE: {relative_rmse:.4f}")
+        print(f"Skill Score: {skill_score:.4f}")
+        print(f"Number of valid pixels: {np.sum(valid_mask):,}")
+
+        self.last_eval_metrics = {
+            'rmse': float(rmse),
+            'mae': float(mae),
+            'r2': float(r2),
+            'bias': float(bias),
+            'mse': float(mse),
+            'relative_mae': float(relative_mae),
+            'relative_rmse': float(relative_rmse),
+            'skill_score': float(skill_score),
+            'n_valid_pixels': int(np.sum(valid_mask))
+        }
+
+        return rmse, mae, r2
+
+    def simulate_future_lst(self, future_landuse_2035, future_landuse_2045,
+                            ndvi_2035=None, ndvi_2045=None,
+                            emissivity_2035=None, emissivity_2045=None):
+        """Simulate future LST for 2035 and 2045 with enhanced urban expansion consideration"""
+        print("\n=== SIMULATING FUTURE LST WITH ENHANCED URBAN EXPANSION ===")
+
+        predictions = {}
+
+        # For future years, use the most recent available NDVI and emissivity if not provided
+        if ndvi_2035 is None:
+            ndvi_2035 = self.lst_data.arr_ndvi3  # Use 2025 NDVI
+            print("Using 2025 NDVI for 2035 prediction")
+
+        if ndvi_2045 is None:
+            ndvi_2045 = self.lst_data.arr_ndvi3  # Use 2025 NDVI
+            print("Using 2025 NDVI for 2045 prediction")
+
+        if emissivity_2035 is None:
+            emissivity_2035 = self.lst_data.arr_emiss3  # Use 2025 emissivity
+            print("Using 2025 emissivity for 2035 prediction")
+
+        if emissivity_2045 is None:
+            emissivity_2045 = self.lst_data.arr_emiss3  # Use 2025 emissivity
+            print("Using 2025 emissivity for 2045 prediction")
+
+        # Enhanced analysis of urban expansion
+        urban_2035 = np.sum(future_landuse_2035 == 1)
+        urban_2045 = np.sum(future_landuse_2045 == 1)
+        urban_2025 = np.sum(self.lst_data.arr_lu3 == 1)
+
+        print(f"\nUrban area analysis:")
+        print(f"  2025: {urban_2025:,} urban pixels")
+        print(f"  2035: {urban_2035:,} urban pixels (change: {urban_2035 - urban_2025:+,d})")
+        print(f"  2045: {urban_2045:,} urban pixels (change: {urban_2045 - urban_2035:+,d})")
+
+        urban_growth_2035 = ((urban_2035 - urban_2025) / urban_2025) * 100 if urban_2025 > 0 else 0
+        urban_growth_2045 = ((urban_2045 - urban_2035) / urban_2035) * 100 if urban_2035 > 0 else 0
+        print(f"  Urban growth rate: 2025-2035: {urban_growth_2035:.1f}%, 2035-2045: {urban_growth_2045:.1f}%")
+
+        # Predict LST for 2035 with enhanced urban consideration
+        print("\nPredicting LST for 2035 with enhanced urban expansion...")
+        lst_2035 = self.predict_lst(future_landuse_2035, ndvi_2035, emissivity_2035,
+                                    apply_thermal_constraints=True, is_future_scenario=True)
+        predictions[2035] = lst_2035
+        valid_mask_2035 = ~np.isnan(lst_2035)
+        print(
+            f"2035 LST - Mean: {np.nanmean(lst_2035):.2f}°C, Range: {np.nanmin(lst_2035):.2f} to {np.nanmax(lst_2035):.2f}°C")
+
+        # Predict LST for 2045 with enhanced urban consideration
+        print("Predicting LST for 2045 with enhanced urban expansion...")
+        lst_2045 = self.predict_lst(future_landuse_2045, ndvi_2045, emissivity_2045,
+                                    apply_thermal_constraints=True, is_future_scenario=True)
+        predictions[2045] = lst_2045
+        valid_mask_2045 = ~np.isnan(lst_2045)
+        print(
+            f"2045 LST - Mean: {np.nanmean(lst_2045):.2f}°C, Range: {np.nanmin(lst_2045):.2f} to {np.nanmax(lst_2045):.2f}°C")
+
+        # Enhanced warming trend analysis
+        lst_2025_mean = np.nanmean(self.lst_data.arr_lst3)
+        warming_2025_2035 = np.nanmean(lst_2035) - lst_2025_mean
+        warming_2035_2045 = np.nanmean(lst_2045) - np.nanmean(lst_2035)
+        total_warming = np.nanmean(lst_2045) - lst_2025_mean
+
+        print(f"\n=== PROJECTED WARMING ANALYSIS ===")
+        print(f"Warming from 2025 to 2035: {warming_2025_2035:.2f}°C")
+        print(f"Warming from 2035 to 2045: {warming_2035_2045:.2f}°C")
+        print(f"Total projected warming 2025-2045: {total_warming:.2f}°C")
+
+        # Urban-specific warming analysis
+        if urban_2035 > 0 and urban_2045 > 0:
+            urban_lst_2035 = np.nanmean(lst_2035[future_landuse_2035 == 1])
+            urban_lst_2045 = np.nanmean(lst_2045[future_landuse_2045 == 1])
+            urban_warming = urban_lst_2045 - urban_lst_2035
+            print(f"Urban-specific warming 2035-2045: {urban_warming:.2f}°C")
+
+            # Urban vs non-urban comparison
+            non_urban_mask_2035 = (future_landuse_2035 != 1) & ~np.isnan(lst_2035)
+            non_urban_lst_2035 = np.nanmean(lst_2035[non_urban_mask_2035]) if np.any(non_urban_mask_2035) else 0
+
+            non_urban_mask_2045 = (future_landuse_2045 != 1) & ~np.isnan(lst_2045)
+            non_urban_lst_2045 = np.nanmean(lst_2045[non_urban_mask_2045]) if np.any(non_urban_mask_2045) else 0
+
+            if non_urban_lst_2035 > 0 and non_urban_lst_2045 > 0:
+                urban_uhi_2035 = urban_lst_2035 - non_urban_lst_2035
+                urban_uhi_2045 = urban_lst_2045 - non_urban_lst_2045
+                print(f"UHI intensity - 2035: {urban_uhi_2035:.2f}°C, 2045: {urban_uhi_2045:.2f}°C")
+
+        return predictions
+
+    def analyze_urban_heat_island_future(self, future_landuse, future_lst, year):
+        """Enhanced UHI analysis for future scenarios"""
+        print(f"\n=== ENHANCED UHI ANALYSIS FOR {year} ===")
+
+        uhi_analysis = {}
+        lst_by_class = {}
+
+        for lu_class in [1, 2, 3, 4]:  # Urban, vegetation, water, other
+            mask = (future_landuse == lu_class) & ~np.isnan(future_lst)
+            if np.any(mask):
+                lst_by_class[lu_class] = np.mean(future_lst[mask])
+                pixel_count = np.sum(mask)
+                std_temp = np.std(future_lst[mask])
+                print(f"Land use class {lu_class}: {lst_by_class[lu_class]:.2f}°C "
+                      f"(±{std_temp:.2f}°C, {pixel_count:,} pixels)")
+            else:
+                lst_by_class[lu_class] = np.nan
+                print(f"Land use class {lu_class}: No data")
+
+        # Calculate UHI intensity (urban - vegetation)
+        if (1 in lst_by_class and 2 in lst_by_class and
+                not np.isnan(lst_by_class[1]) and not np.isnan(lst_by_class[2])):
+            uhi_intensity = lst_by_class[1] - lst_by_class[2]
+            print(f"UHI Intensity (Urban - Vegetation): {uhi_intensity:.2f}°C")
+            uhi_analysis['uhi_intensity'] = uhi_intensity
+
+            # Enhanced UHI analysis
+            if uhi_intensity > 1.0:
+                print(f"  ↳ Strong UHI effect: Urban areas are {uhi_intensity:.2f}°C warmer")
+            elif uhi_intensity > 0.5:
+                print(f"  ↳ Moderate UHI effect: Urban areas are {uhi_intensity:.2f}°C warmer")
+            elif uhi_intensity > 0:
+                print(f"  ↳ Weak UHI effect: Urban areas are {uhi_intensity:.2f}°C warmer")
+            else:
+                print(f"  ↳ No significant UHI effect detected")
+        else:
+            uhi_analysis['uhi_intensity'] = np.nan
+
+        uhi_analysis['lst_by_class'] = lst_by_class
+        return uhi_analysis
+
+
+def exportLST(array, outFileName, template_ds):
+    """Export LST prediction as GeoTIFF"""
+    driver = gdal.GetDriverByName("GTiff")
+    outdata = driver.Create(outFileName, template_ds.RasterXSize, template_ds.RasterYSize, 1, gdal.GDT_Float32)
+    outdata.SetGeoTransform(template_ds.GetGeoTransform())
+    outdata.SetProjection(template_ds.GetProjection())
+    # Replace NaN with a specific NoData value
+    array_export = array.copy()
+    array_export[np.isnan(array_export)] = -9999
+    outdata.GetRasterBand(1).WriteArray(array_export)
+    outdata.GetRasterBand(1).SetNoDataValue(-9999)
+    outdata.FlushCache()
+    outdata = None
+    print(f"Exported {outFileName}")
+
+
+def plot_lst_comparison(historical_lst, predicted_lst, years):
+    """Plot comprehensive LST analysis"""
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+    # Plot 1: LST maps comparison
+    for i, (year, lst) in enumerate(list(historical_lst.items())[:3]):  # Only plot first 3 historical years
+        im = axes[0, i].imshow(lst, cmap='coolwarm', vmin=15, vmax=45)
+        axes[0, i].set_title(f'LST {year} (°C)')
+        axes[0, i].axis('off')
+        plt.colorbar(im, ax=axes[0, i])
+
+    # Plot 2: Future predictions
+    for i, (year, lst) in enumerate(predicted_lst.items()):
+        im = axes[1, i].imshow(lst, cmap='coolwarm', vmin=15, vmax=45)
+        axes[1, i].set_title(f'Predicted LST {year} (°C)')
+        axes[1, i].axis('off')
+        plt.colorbar(im, ax=axes[1, i])
+
+    plt.tight_layout()
+    plt.savefig('lst_comparison_maps.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # Plot temperature trends
+    plt.figure(figsize=(10, 6))
+
+    historical_years = list(historical_lst.keys())
+    historical_means = [np.nanmean(lst) for lst in historical_lst.values()]
+
+    predicted_years = list(predicted_lst.keys())
+    predicted_means = [np.nanmean(lst) for lst in predicted_lst.values()]
+
+    all_years = historical_years + predicted_years
+    all_means = historical_means + predicted_means
+
+    plt.plot(historical_years, historical_means, 'bo-', linewidth=2, markersize=8, label='Historical')
+    plt.plot(predicted_years, predicted_means, 'ro-', linewidth=2, markersize=8, label='Predicted')
+    plt.xlabel('Year')
+    plt.ylabel('Mean LST (°C)')
+    plt.title('Land Surface Temperature Trends')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.savefig('lst_trends.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+if __name__ == "__main__":
+    # Set environment variable for memory optimization
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+
+    # LST data files
+    lst_files = [
+        "ForLST/LST2015.tif",
+        "ForLST/LST2020.tif",
+        "ForLST/LST2025.tif"
+    ]
+
+    # Land use files
+    landuse_files = [
+        "ForLST/2015_cleaned.tif",
+        "ForLST/2020_cleaned.tif",
+        "ForLST/2025_cleaned.tif"
+    ]
+
+    # NDVI files
+    ndvi_files = [
+        "ForLST/NDVI 2015.tif",
+        "ForLST/NDVI 2020.tif",
+        "ForLST/NDVI 2025.tif"
+    ]
+
+    # Emissivity files
+    emissivity_files = [
+        "ForLST/Emissivity 2015.tif",
+        "ForLST/Emissivity 2020.tif",
+        "ForLST/Emissivity 2025.tif"
+    ]
+
+    # Factor files
+    factor_files = [
+        "ForLST/amenitykernel_cleaned.tif",
+        "ForLST/building density.tif",
+        "ForLST/CBD_cleaned (1).tif",
+        "ForLST/commercialkernel_cleaned.tif",
+        "ForLST/industrailkernel_cleaned.tif",
+        "ForLST/ntl_cleaned.tif",
+        "ForLST/pop_cleaned.tif",
+        "ForLST/restricted_cleaned.tif",
+        "ForLST/road density.tif",
+        "ForLST/road_cleaned.tif",
+        "ForLST/slope_cleaned.tif"
+    ]
+
+    # Future land use predictions
+    future_landuse_2035_file = "ForLST/predicted_2035_enhanced_transformer.tif"
+    future_landuse_2045_file = "ForLST/predicted_2045_enhanced_transformer.tif"
+
+    print("=== Loading LST and Related Data ===")
+    lst_data = LSTData(lst_files, landuse_files, ndvi_files, emissivity_files)
+
+    print("\n=== Loading Factors ===")
+    lst_factors = LSTFactors(*factor_files)
+
+    print("\n=== Initializing Enhanced LST Simulator Model ===")
+    lst_simulator = LSTSimulator(lst_data, lst_factors, patch_size=64)
+    lst_simulator.build_model()
+
+    print("\n=== Training Enhanced LST Model ===")
+    start_time = time.time()
+    history = lst_simulator.train(epochs=100, batch_size=8)
+    end_time = time.time()
+    print(f"Training time: {(end_time - start_time) / 60:.2f} minutes")
+
+    print("\n=== Evaluating Model (Predicting 2025 LST) ===")
+    # Use 2025 factors to predict 2025 LST and compare with actual
+    predicted_2025_lst = lst_simulator.predict_lst(
+        lst_data.arr_lu3,  # 2025 land use
+        lst_data.arr_ndvi3,  # 2025 NDVI
+        lst_data.arr_emiss3  # 2025 emissivity
+    )
+
+    rmse, mae, r2 = lst_simulator.evaluate(lst_data.arr_lst3, predicted_2025_lst)
+    exportLST(predicted_2025_lst, 'predicted_2025_lst_enhanced.tif', lst_data.ds_lst1)
+
+    print("\n=== Loading Future Land Use Predictions ===")
+    _, future_landuse_2035 = readraster(future_landuse_2035_file)
+    _, future_landuse_2045 = readraster(future_landuse_2045_file)
+
+    print(f"Future land use 2035 - Urban pixels: {np.sum(future_landuse_2035 == 1):,}")
+    print(f"Future land use 2045 - Urban pixels: {np.sum(future_landuse_2045 == 1):,}")
+
+    print("\n=== Simulating Future LST (2035 and 2045) ===")
+    future_lst_predictions = lst_simulator.simulate_future_lst(
+        future_landuse_2035,
+        future_landuse_2045
+    )
+
+    # Export future LST predictions
+    for year, lst_prediction in future_lst_predictions.items():
+        exportLST(lst_prediction, f'predicted_lst_{year}_enhanced.tif', lst_data.ds_lst1)
+
+        # Analyze UHI for future scenarios
+        future_landuse = future_landuse_2035 if year == 2035 else future_landuse_2045
+        uhi_analysis = lst_simulator.analyze_urban_heat_island_future(
+            future_landuse, lst_prediction, year
+        )
+
+    # Plot comprehensive results
+    historical_lst = {
+        2015: lst_data.arr_lst1,
+        2020: lst_data.arr_lst2,
+        2025: lst_data.arr_lst3
+    }
+
+    plot_lst_comparison(historical_lst, future_lst_predictions, [2035, 2045])
+
+    # Enhanced training history plot
+    plt.figure(figsize=(15, 5))
+
+    plt.subplot(1, 3, 1)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Val Loss')
+    plt.title('Enhanced LST Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Combined Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plt.subplot(1, 3, 2)
+    plt.plot(history['train_mae'], label='Train MAE')
+    plt.plot(history['val_mae'], label='Val MAE')
+    plt.title('Enhanced LST Model MAE (°C)')
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plt.subplot(1, 3, 3)
+    plt.plot(history['learning_rate'], label='Learning Rate')
+    plt.title('Learning Rate Schedule')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('lst_enhanced_training_history.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    print("\n=== ENHANCED MODEL COMPLETED SUCCESSFULLY ===")
+    print("\nEnhanced LST Simulation Features:")
+    print("  - Advanced ResNet-Transformer architecture with squeeze-and-excitation")
+    print("  - Multi-scale feature fusion and skip connections")
+    print("  - Enhanced feature engineering with derived urban indicators")
+    print("  - Robust normalization and improved data preprocessing")
+    print("  - Optimized loss function weights (0.3 MSE + 0.4 MAE + 0.3 Huber)")
+    print("  - Reduced learning rate (0.0005) for better convergence")
+    print("  - Tighter gradient clipping (0.5) for stable training")
+    print("  - OneCycle learning rate scheduling")
+    print("  - Full 100-epoch training without early stopping")
+    print("  - Enhanced urban expansion modeling")
+    print("  - Physical thermal constraints with edge preservation")
+    print(f"  - Enhanced model performance: RMSE={rmse:.3f}°C, MAE={mae:.3f}°C, R²={r2:.4f}")
+
+    if 'skill_score' in lst_simulator.last_eval_metrics:
+        skill = lst_simulator.last_eval_metrics['skill_score']
+        print(f"  - Skill Score: {skill:.4f} (higher is better)")
+
