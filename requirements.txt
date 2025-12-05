@@ -1,0 +1,50 @@
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Geospatial Data Processing
+GDAL>=3.0.0
+rasterio>=1.3.0
+
+# Numerical Computing and Scientific Libraries
+numpy>=1.21.0,<2.0.0
+scipy>=1.8.0
+
+# Machine Learning
+scikit-learn>=1.0.0
+
+# Data Manipulation
+pandas>=1.4.0
+
+# Visualization
+matplotlib>=3.5.0
+seaborn>=0.12.0
+
+# Image Processing
+Pillow>=9.0.0
+
+# Progress bars and utilities
+tqdm>=4.64.0
+
+# System utilities
+psutil>=5.9.0
+
+# For reproducibility
+python-dateutil>=2.8.2
+
+# Optional: For experiment tracking (uncomment if needed)
+# tensorboard>=2.11.0
+# wandb>=0.13.0
+
+# Optional: For model optimization (uncomment if needed)
+# onnx>=1.13.0
+# onnxruntime>=1.14.0
+
+# Development dependencies (uncomment if needed)
+# pytest>=7.2.0
+# black>=22.12.0
+# flake8>=6.0.0
+# mypy>=0.991
+# jupyter>=1.0.0
+# ipykernel>=6.20.0
