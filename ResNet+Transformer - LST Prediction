@@ -1184,8 +1184,31 @@ class LSTSimulator:
             urban_intensity = self.factors.factors[2] * (lu_arr == 1).astype(np.float32)
             input_layers.append(urban_intensity)
 
-        # 2. Vegetation cooling effect
-        vegetation_cooling = ndvi_arr * (lu_arr == 2).astype(np.float32)
+        # 2. Vegetation cooling effect - CHANGED to [(NDVI - NDVI_min) / (NDVI_max - NDVI_min)]^2
+        # Create vegetation mask (assuming 2 is vegetation)
+        vegetation_mask = (lu_arr == 2).astype(np.float32)
+        
+        # Calculate NDVI min and max for normalization
+        valid_ndvi_mask = ~np.isnan(ndvi_arr)
+        if np.any(valid_ndvi_mask):
+            ndvi_min = np.nanmin(ndvi_arr)
+            ndvi_max = np.nanmax(ndvi_arr)
+            ndvi_range = ndvi_max - ndvi_min
+            
+            if ndvi_range > 0:
+                # Normalize NDVI to 0-1 range
+                ndvi_normalized = (ndvi_arr - ndvi_min) / ndvi_range
+                # Square the normalized NDVI
+                ndvi_squared = ndvi_normalized ** 2
+                # Apply vegetation mask
+                vegetation_cooling = ndvi_squared * vegetation_mask
+            else:
+                # If no range, use zeros
+                vegetation_cooling = np.zeros_like(ndvi_arr, dtype=np.float32)
+        else:
+            # If no valid NDVI, use zeros
+            vegetation_cooling = np.zeros_like(ndvi_arr, dtype=np.float32)
+            
         input_layers.append(vegetation_cooling)
 
         # 3. Distance-based features (inverse of distance)
