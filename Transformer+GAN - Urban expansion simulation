@@ -1,0 +1,1763 @@
+import os
+import math
+import numpy as np
+from osgeo import gdal
+from copy import deepcopy
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.nn import functional as F
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, jaccard_score
+import matplotlib.pyplot as plt
+import time
+import seaborn as sns
+import pandas as pd
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Clear GPU memory
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+
+def readraster(file):
+    dataSource = gdal.Open(file)
+    if dataSource is None:
+        raise FileNotFoundError(f"Unable to open raster: {file}")
+    band = dataSource.GetRasterBand(1)
+    band_array = band.ReadAsArray()
+    return dataSource, band_array
+
+
+def identicalList(inList):
+    inList = np.array(inList)
+    if len(inList) == 0:
+        return True
+    logical = inList == inList[0]
+    return bool(np.all(logical))
+
+
+def builtupAreaDifference(landcover1, landcover2, buclass=1, cellsize=30):
+    return np.sum(((landcover2 == buclass).astype(int) - (landcover1 == buclass).astype(int)) != 0) * (
+            cellsize ** 2) / 1000000
+
+
+class LandCoverData:
+    def __init__(self, file1, file2, file3=None):
+        self.ds_lc1, self.arr_lc1 = readraster(file1)
+        self.ds_lc2, self.arr_lc2 = readraster(file2)
+        if file3:
+            self.ds_lc3, self.arr_lc3 = readraster(file3)
+        else:
+            self.ds_lc3, self.arr_lc3 = None, None
+        self.performChecks()
+
+    def performChecks(self):
+        print("Checking the size of input rasters...")
+        if (self.ds_lc1.RasterXSize == self.ds_lc2.RasterXSize) and (
+                self.ds_lc1.RasterYSize == self.ds_lc2.RasterYSize):
+            print("Land cover data size matched.")
+            self.row, self.col = (self.ds_lc1.RasterYSize, self.ds_lc1.RasterXSize)
+        else:
+            raise ValueError("Input land cover files have different height and width.")
+        print("\nChecking feature classes in land cover data...")
+        unique1 = np.unique(self.arr_lc1)
+        unique2 = np.unique(self.arr_lc2)
+        print(f"Classes in first file: {unique1}")
+        print(f"Classes in second file: {unique2}")
+
+        if set(unique1) == set(unique2):
+            print("The classes in input land cover files are matched.")
+        else:
+            print("Warning: Input land cover data have different class values.")
+
+
+class GrowthFactors:
+    def __init__(self, *args):
+        self.gf = {}
+        self.gf_ds = {}
+        self.nFactors = len(args)
+        n = 1
+        for file in args:
+            self.gf_ds[n], self.gf[n] = readraster(file)
+            n += 1
+        self.performChecks()
+
+    def performChecks(self):
+        print("\nChecking the size of input growth factors...")
+        rows = []
+        cols = []
+        for n in range(1, self.nFactors + 1):
+            rows.append(self.gf_ds[n].RasterYSize)
+            cols.append(self.gf_ds[n].RasterXSize)
+        if identicalList(rows) and identicalList(cols):
+            print("Input factors have same row and column value.")
+            self.row = rows[0]
+            self.col = cols[0]
+        else:
+            raise ValueError("Input factors have different row and column value.")
+
+
+class UrbanExpansionDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+# ============================================================================
+# Enhanced Memory-Efficient Transformer Components
+# ============================================================================
+
+class PositionalEncoding2D(nn.Module):
+    """2D Positional Encoding for spatial transformers with enhanced spatial awareness"""
+
+    def __init__(self, channels, height, width):
+        super(PositionalEncoding2D, self).__init__()
+        self.channels = channels
+        self.height = height
+        self.width = width
+
+        pe = torch.zeros(channels, height, width)
+
+        # Create positional grids
+        y_pos = torch.arange(0, height).unsqueeze(1).repeat(1, width).float()
+        x_pos = torch.arange(0, width).unsqueeze(0).repeat(height, 1).float()
+
+        # Normalize positions
+        y_pos = 2 * (y_pos / height) - 1  # Normalize to [-1, 1]
+        x_pos = 2 * (x_pos / width) - 1  # Normalize to [-1, 1]
+
+        # Multiple frequency bands for better spatial representation
+        num_bands = channels // 4
+        if num_bands < 1:
+            num_bands = 1
+
+        div_term = torch.exp(torch.arange(0, num_bands).float() *
+                             (-math.log(10000.0) / num_bands))
+
+        pos_idx = 0
+        for i in range(0, channels, 4):
+            if pos_idx < num_bands:
+                # Sine and cosine for y position
+                if i < channels:
+                    pe[i, :, :] = torch.sin(y_pos * div_term[pos_idx])
+                if i + 1 < channels:
+                    pe[i + 1, :, :] = torch.cos(y_pos * div_term[pos_idx])
+                # Sine and cosine for x position
+                if i + 2 < channels:
+                    pe[i + 2, :, :] = torch.sin(x_pos * div_term[pos_idx])
+                if i + 3 < channels:
+                    pe[i + 3, :, :] = torch.cos(x_pos * div_term[pos_idx])
+                pos_idx += 1
+
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :, :x.size(2), :x.size(3)]
+
+
+class MemoryEfficientSpatialAttention(nn.Module):
+    """Enhanced memory-efficient multi-head attention with spatial constraints"""
+
+    def __init__(self, channels, num_heads=4, reduction_ratio=4):
+        super(MemoryEfficientSpatialAttention, self).__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.reduction_ratio = reduction_ratio
+
+        assert channels % num_heads == 0, "channels must be divisible by num_heads"
+
+        self.query = nn.Conv2d(channels, channels, kernel_size=1)
+        self.key = nn.Conv2d(channels, channels, kernel_size=1)
+        self.value = nn.Conv2d(channels, channels, kernel_size=1)
+        self.out = nn.Conv2d(channels, channels, kernel_size=1)
+
+        self.scale = self.head_dim ** -0.5
+
+        # Spatial reduction
+        self.spatial_reduction = nn.Conv2d(channels, channels, kernel_size=reduction_ratio,
+                                           stride=reduction_ratio, groups=channels)
+        self.spatial_upsample = nn.Upsample(scale_factor=reduction_ratio, mode='bilinear')
+
+        self.attention_weights = None
+
+    def forward(self, x):
+        batch, channels, height, width = x.shape
+
+        # Apply spatial reduction to save memory
+        reduced_height = height // self.reduction_ratio
+        reduced_width = width // self.reduction_ratio
+
+        # Create reduced version for key and value
+        x_reduced = self.spatial_reduction(x)
+
+        q = self.query(x)
+        k = self.key(x_reduced)
+        v = self.value(x_reduced)
+
+        # Reshape for attention
+        q = q.view(batch, self.num_heads, self.head_dim, height * width)
+        k = k.view(batch, self.num_heads, self.head_dim, reduced_height * reduced_width)
+        v = v.view(batch, self.num_heads, self.head_dim, reduced_height * reduced_width)
+
+        q = q.transpose(2, 3)  # [batch, heads, h*w, head_dim]
+        k = k.transpose(2, 3)  # [batch, heads, reduced_h*reduced_w, head_dim]
+        v = v.transpose(2, 3)  # [batch, heads, reduced_h*reduced_w, head_dim]
+
+        # Compute attention with reduced dimensions
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        attn = F.softmax(attn, dim=-1)
+
+        try:
+            self.attention_weights = attn.detach().cpu().numpy()
+        except Exception:
+            self.attention_weights = None
+
+        out = torch.matmul(attn, v)  # [batch, heads, h*w, head_dim]
+
+        out = out.transpose(2, 3).contiguous()
+        out = out.view(batch, channels, height, width)
+
+        out = self.out(out)
+
+        return out
+
+
+class TransformerBlock(nn.Module):
+    """Enhanced transformer block with realistic constraints"""
+
+    def __init__(self, channels, num_heads=4, mlp_ratio=2.0, dropout=0.1, reduction_ratio=4):
+        super(TransformerBlock, self).__init__()
+
+        self.norm1 = nn.BatchNorm2d(channels)
+        self.attention = MemoryEfficientSpatialAttention(channels, num_heads, reduction_ratio)
+        self.dropout1 = nn.Dropout2d(dropout)
+
+        self.norm2 = nn.BatchNorm2d(channels)
+        mlp_hidden = int(channels * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, mlp_hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(mlp_hidden, channels, kernel_size=1),
+            nn.Dropout2d(dropout)
+        )
+
+    def forward(self, x):
+        residual = x
+        x = self.norm1(x)
+        x = self.attention(x)
+        x = self.dropout1(x)
+        x = x + residual
+
+        residual = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = x + residual
+        return x
+
+
+class SpatialTransformer(nn.Module):
+    """Enhanced Spatial Transformer Network with realistic urban growth patterns"""
+
+    def __init__(self, in_channels, out_channels, num_layers=2, num_heads=4,
+                 mlp_ratio=2.0, dropout=0.1, patch_size=64, reduction_ratio=4):
+        super(SpatialTransformer, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.patch_size = patch_size
+
+        self.input_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.pos_encoding = PositionalEncoding2D(out_channels, patch_size, patch_size)
+
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(out_channels, num_heads, mlp_ratio, dropout, reduction_ratio)
+            for _ in range(num_layers)
+        ])
+
+        self.norm = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.pos_encoding(x)
+
+        for block in self.transformer_blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        return x
+
+    def get_attention_weights(self):
+        """Extract attention weights from all transformer blocks"""
+        attention_weights = {}
+        for idx, block in enumerate(self.transformer_blocks):
+            if hasattr(block.attention, 'attention_weights') and block.attention.attention_weights is not None:
+                attention_weights[f'layer_{idx}'] = block.attention.attention_weights
+        return attention_weights
+
+
+# ============================================================================
+# GAN Components (Replacing ResNet)
+# ============================================================================
+
+class GeneratorBlock(nn.Module):
+    """Generator block for urban growth pattern generation"""
+    
+    def __init__(self, in_channels, out_channels, use_attention=False):
+        super(GeneratorBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        # Skip connection
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+        
+        # Optional attention mechanism
+        self.use_attention = use_attention
+        if use_attention:
+            self.channel_attention = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(out_channels, out_channels // 16, kernel_size=1),
+                nn.ReLU(),
+                nn.Conv2d(out_channels // 16, out_channels, kernel_size=1),
+                nn.Sigmoid()
+            )
+            self.spatial_attention = nn.Sequential(
+                nn.Conv2d(out_channels, 1, kernel_size=7, padding=3),
+                nn.Sigmoid()
+            )
+    
+    def forward(self, x):
+        identity = self.shortcut(x)
+        
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        # Apply attention if enabled
+        if self.use_attention:
+            channel_att = self.channel_attention(out)
+            out = out * channel_att
+            
+            spatial_att = self.spatial_attention(out)
+            out = out * spatial_att
+        
+        out = out + identity
+        out = self.relu(out)
+        
+        return out
+
+
+class UrbanGrowthGenerator(nn.Module):
+    """Generator network for urban growth simulation"""
+    
+    def __init__(self, input_channels, base_channels=32, patch_size=64):
+        super(UrbanGrowthGenerator, self).__init__()
+        
+        self.patch_size = patch_size
+        
+        # Initial feature extraction
+        self.init_conv = nn.Conv2d(input_channels, base_channels, kernel_size=3, padding=1)
+        self.init_bn = nn.BatchNorm2d(base_channels)
+        self.init_relu = nn.ReLU()
+        
+        # Encoder blocks
+        self.encoder_blocks = nn.ModuleList([
+            GeneratorBlock(base_channels, base_channels * 2, use_attention=True),
+            GeneratorBlock(base_channels * 2, base_channels * 4, use_attention=True),
+            GeneratorBlock(base_channels * 4, base_channels * 8, use_attention=True)
+        ])
+        
+        # Bottleneck with transformer
+        self.transformer = SpatialTransformer(
+            in_channels=base_channels * 8,
+            out_channels=base_channels * 8,
+            num_layers=2,
+            num_heads=4,
+            mlp_ratio=2.0,
+            dropout=0.1,
+            patch_size=patch_size // 8,  # Reduced size after encoding
+            reduction_ratio=4
+        )
+        
+        # Decoder blocks with skip connections
+        self.decoder_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.ConvTranspose2d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2),
+                GeneratorBlock(base_channels * 4, base_channels * 4, use_attention=True)
+            ),
+            nn.Sequential(
+                nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2),
+                GeneratorBlock(base_channels * 2, base_channels * 2, use_attention=True)
+            ),
+            nn.Sequential(
+                nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2),
+                GeneratorBlock(base_channels, base_channels, use_attention=True)
+            )
+        ])
+        
+        # Output layer with growth constraints
+        self.output_layer = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels // 2),
+            nn.ReLU(),
+            nn.Conv2d(base_channels // 2, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+        # Growth rate controller
+        self.growth_controller = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(base_channels * 8, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        )
+        
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        # Clear cache periodically
+        if torch.cuda.is_available() and x.device.type == 'cuda':
+            if np.random.random() < 0.01:
+                torch.cuda.empty_cache()
+        
+        # Initial feature extraction
+        x = self.init_conv(x)
+        x = self.init_bn(x)
+        x = self.init_relu(x)
+        
+        # Store intermediate features for skip connections
+        encoder_features = []
+        
+        # Encoder path
+        for encoder_block in self.encoder_blocks:
+            x = encoder_block(x)
+            encoder_features.append(x)
+            x = F.max_pool2d(x, kernel_size=2, stride=2)
+        
+        # Transformer bottleneck
+        x = self.transformer(x)
+        
+        # Apply growth control
+        growth_factor = self.growth_controller(x)
+        x = x * growth_factor.view(-1, 1, 1, 1)
+        
+        # Decoder path with skip connections
+        for i, decoder_block in enumerate(self.decoder_blocks):
+            # Get corresponding encoder feature (reverse order)
+            if i < len(encoder_features):
+                enc_feat = encoder_features[-(i+1)]
+                # Resize encoder feature if needed
+                if enc_feat.size()[-2:] != x.size()[-2:]:
+                    enc_feat = F.interpolate(enc_feat, size=x.size()[-2:], mode='bilinear', align_corners=True)
+                x = x + enc_feat  # Skip connection
+            
+            x = decoder_block(x)
+        
+        # Final output
+        x = self.output_layer(x)
+        
+        return x
+
+
+class UrbanGrowthDiscriminator(nn.Module):
+    """Discriminator network for urban growth GAN - FIXED OUTPUT SIZE"""
+    
+    def __init__(self, input_channels, base_channels=32, patch_size=64):
+        super(UrbanGrowthDiscriminator, self).__init__()
+        
+        self.patch_size = patch_size
+        
+        # Input processing: concatenate generated/real map with input conditions
+        self.input_conv = nn.Conv2d(input_channels + 1, base_channels, kernel_size=3, padding=1)
+        self.input_bn = nn.BatchNorm2d(base_channels)
+        self.input_relu = nn.LeakyReLU(0.2)
+        
+        # Discriminator blocks - adjusted to produce 1x1 output instead of 4x4
+        self.disc_blocks = nn.ModuleList([
+            self._make_disc_block(base_channels, base_channels * 2),
+            self._make_disc_block(base_channels * 2, base_channels * 4),
+            self._make_disc_block(base_channels * 4, base_channels * 8),
+            self._make_disc_block(base_channels * 8, base_channels * 16),
+            nn.Conv2d(base_channels * 16, base_channels * 16, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels * 16),
+            nn.LeakyReLU(0.2),
+        ])
+        
+        # Final convolution to get 1x1 output
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(base_channels * 16, base_channels * 8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 8),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(base_channels * 8, base_channels * 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(base_channels * 4, 1, kernel_size=1),
+        )
+        
+        self._initialize_weights()
+    
+    def _make_disc_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2)
+        )
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.normal_(m.weight, 1.0, 0.02)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x, condition):
+        # Concatenate input with condition
+        x = torch.cat([x, condition], dim=1)
+        
+        # Initial processing
+        x = self.input_conv(x)
+        x = self.input_bn(x)
+        x = self.input_relu(x)
+        
+        # Discriminator blocks
+        for disc_block in self.disc_blocks:
+            x = disc_block(x)
+        
+        # Final convolution
+        x = self.final_conv(x)
+        
+        # Global average pooling to get single value
+        x = F.adaptive_avg_pool2d(x, 1)
+        
+        return x.view(x.size(0), -1)
+
+
+# ============================================================================
+# Main Model: CA + GAN + Transformer
+# ============================================================================
+
+class CAGANTransformerModel(nn.Module):
+    """CA + GAN + Transformer hybrid model for urban expansion simulation"""
+    
+    def __init__(self, input_channels, patch_size=64, use_gan=True):
+        super(CAGANTransformerModel, self).__init__()
+        
+        self.patch_size = patch_size
+        self.use_gan = use_gan
+        
+        # Generator (main network)
+        self.generator = UrbanGrowthGenerator(input_channels, base_channels=32, patch_size=patch_size)
+        
+        # Discriminator (only used during training if GAN is enabled)
+        if use_gan:
+            self.discriminator = UrbanGrowthDiscriminator(input_channels, base_channels=32, patch_size=patch_size)
+        
+        # Feature refinement transformer
+        self.refinement_transformer = SpatialTransformer(
+            in_channels=1,
+            out_channels=32,
+            num_layers=1,
+            num_heads=4,
+            mlp_ratio=2.0,
+            dropout=0.1,
+            patch_size=patch_size,
+            reduction_ratio=4
+        )
+        
+        # Final processing
+        self.final_processing = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.Conv2d(16, 8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(),
+            nn.Conv2d(8, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x, discriminator_mode=False, condition=None):
+        if discriminator_mode and self.use_gan:
+            # In discriminator mode, return discriminator outputs
+            return self.discriminator(x, condition)
+        
+        # Generator forward pass
+        generated = self.generator(x)
+        
+        # Apply refinement transformer
+        refined = self.refinement_transformer(generated)
+        
+        # Final output
+        output = self.final_processing(refined)
+        
+        return output
+    
+    def generate(self, x):
+        """Generate urban expansion map"""
+        with torch.no_grad():
+            return self.forward(x)
+    
+    def discriminate(self, x, condition):
+        """Discriminate between real and generated maps"""
+        with torch.no_grad():
+            if self.use_gan:
+                return self.forward(x, discriminator_mode=True, condition=condition)
+            return None
+
+
+# ============================================================================
+# Enhanced Deep Learning CA Model with GAN
+# ============================================================================
+
+class DeepLearningCA:
+    def __init__(self, landcover_data, growth_factors, patch_size=64, use_gan=True):
+        self.landcovers = landcover_data
+        self.factors = growth_factors
+        self.patch_size = patch_size
+        self.use_gan = use_gan
+        self.model = None
+        self.performChecks()
+        self.last_eval_metrics = None
+        self.attention_history = []
+        self.experiment_results = {}
+        
+        # Enhanced growth analysis
+        self.historical_analysis = self._analyze_historical_growth()
+        self.annual_growth_rate = self._calculate_annual_growth_rate()
+        self.growth_momentum = self._calculate_growth_momentum()
+        self.urban_capacity = self._estimate_urban_capacity()
+        
+        print("\n=== HISTORICAL GROWTH ANALYSIS ===")
+        print(f"Urban area 2005: {self.historical_analysis['urban_2005']} pixels")
+        print(f"Urban area 2015: {self.historical_analysis['urban_2015']} pixels")
+        if self.landcovers.arr_lc3 is not None:
+            print(f"Urban area 2025: {self.historical_analysis['urban_2025']} pixels")
+        print(f"Annual growth rate: {self.annual_growth_rate:.6f}")
+        print(f"Growth momentum: {self.growth_momentum:.4f}")
+        print(f"Estimated urban capacity: {self.urban_capacity} pixels")
+        
+        if use_gan:
+            print("\n=== USING GAN + TRANSFORMER ARCHITECTURE ===")
+
+    def performChecks(self):
+        print("\nMatching the size of land cover and growth factors...")
+        if (self.landcovers.row == self.factors.row) and (self.landcovers.col == self.factors.col):
+            print("Size of rasters matched.")
+            self.row = self.factors.row
+            self.col = self.factors.col
+        else:
+            raise ValueError("ERROR! Raster size not matched please check.")
+
+    def _analyze_historical_growth(self):
+        """Comprehensive analysis of historical urban growth patterns"""
+        analysis = {}
+        
+        # Urban areas
+        analysis['urban_2005'] = np.sum(self.landcovers.arr_lc1 == 1)
+        analysis['urban_2015'] = np.sum(self.landcovers.arr_lc2 == 1)
+        if self.landcovers.arr_lc3 is not None:
+            analysis['urban_2025'] = np.sum(self.landcovers.arr_lc3 == 1)
+        
+        # Land cover transitions
+        analysis['transitions_2005_2015'] = self._analyze_transitions(self.landcovers.arr_lc1, self.landcovers.arr_lc2)
+        if self.landcovers.arr_lc3 is not None:
+            analysis['transitions_2015_2025'] = self._analyze_transitions(self.landcovers.arr_lc2,
+                                                                          self.landcovers.arr_lc3)
+        
+        # Spatial patterns
+        analysis['spatial_clustering'] = self._analyze_spatial_clustering()
+        analysis['growth_direction'] = self._analyze_growth_direction()
+        
+        return analysis
+
+    def _analyze_transitions(self, lc1, lc2):
+        """Analyze land cover transitions between two time periods"""
+        transitions = {}
+        classes = [0, 1, 2, 3, 4]
+        
+        for from_class in classes:
+            for to_class in classes:
+                if from_class != to_class:
+                    mask = (lc1 == from_class) & (lc2 == to_class)
+                    transitions[f'{from_class}_to_{to_class}'] = np.sum(mask)
+        
+        return transitions
+
+    def _analyze_spatial_clustering(self):
+        """Analyze spatial clustering of urban areas"""
+        from scipy import ndimage
+        
+        urban_2015 = (self.landcovers.arr_lc2 == 1).astype(int)
+        if np.sum(urban_2015) == 0:
+            return {'avg_cluster_size': 0, 'num_clusters': 0}
+        
+        labeled_array, num_features = ndimage.label(urban_2015)
+        cluster_sizes = [np.sum(labeled_array == i) for i in range(1, num_features + 1)]
+        
+        return {
+            'avg_cluster_size': np.mean(cluster_sizes) if cluster_sizes else 0,
+            'num_clusters': num_features,
+            'max_cluster_size': np.max(cluster_sizes) if cluster_sizes else 0
+        }
+
+    def _analyze_growth_direction(self):
+        """Analyze predominant direction of urban growth"""
+        if self.landcovers.arr_lc3 is None:
+            return {'direction': 'unknown', 'intensity': 0}
+        
+        # Calculate centroid of urban areas
+        urban_2005 = (self.landcovers.arr_lc1 == 1)
+        urban_2025 = (self.landcovers.arr_lc3 == 1)
+        
+        if np.sum(urban_2005) == 0 or np.sum(urban_2025) == 0:
+            return {'direction': 'unknown', 'intensity': 0}
+        
+        y2005, x2005 = np.where(urban_2005)
+        y2025, x2025 = np.where(urban_2025)
+        
+        centroid_2005 = np.array([np.mean(y2005), np.mean(x2005)])
+        centroid_2025 = np.array([np.mean(y2025), np.mean(x2025)])
+        
+        direction_vector = centroid_2025 - centroid_2005
+        direction_magnitude = np.linalg.norm(direction_vector)
+        
+        # Normalize and determine direction
+        if direction_magnitude > 0:
+            direction_vector = direction_vector / direction_magnitude
+            directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+            angle = np.arctan2(direction_vector[1], direction_vector[0]) * 180 / np.pi
+            direction_idx = int((angle + 180 + 22.5) / 45) % 8
+            direction = directions[direction_idx]
+        else:
+            direction = 'stable'
+        
+        return {
+            'direction': direction,
+            'intensity': direction_magnitude / max(self.row, self.col),
+            'vector': direction_vector
+        }
+
+    def _calculate_annual_growth_rate(self):
+        """Calculate realistic annual growth rate based on historical data"""
+        if self.landcovers.arr_lc3 is not None:
+            # Use both periods for more robust estimation
+            growth_2005_2015 = self.historical_analysis['urban_2015'] - self.historical_analysis['urban_2005']
+            growth_2015_2025 = self.historical_analysis['urban_2025'] - self.historical_analysis['urban_2015']
+            
+            # Weighted average giving more weight to recent growth
+            total_growth = growth_2005_2015 + growth_2015_2025
+            annual_growth = total_growth / 20  # 20 years total
+            
+        else:
+            # Single period
+            growth = self.historical_analysis['urban_2015'] - self.historical_analysis['urban_2005']
+            annual_growth = growth / 10  # 10 years
+        
+        # Convert to growth rate (fraction of total area)
+        total_area = self.row * self.col
+        growth_rate = annual_growth / total_area
+        
+        # Apply decay factor for future projections (growth typically slows down)
+        decay_factor = 0.8
+        return growth_rate * decay_factor
+
+    def _calculate_growth_momentum(self):
+        """Calculate growth momentum based on historical acceleration"""
+        if self.landcovers.arr_lc3 is not None:
+            growth_1 = (self.historical_analysis['urban_2015'] - self.historical_analysis['urban_2005']) / 10
+            growth_2 = (self.historical_analysis['urban_2025'] - self.historical_analysis['urban_2015']) / 10
+            momentum = (growth_2 - growth_1) / growth_1 if growth_1 > 0 else 0
+            return max(min(momentum, 0.5), -0.3)  # Cap momentum between -30% and +50%
+        return 0.0
+
+    def _estimate_urban_capacity(self):
+        """Estimate maximum possible urban area based on available land"""
+        # Consider only convertible land (not water, not already urban, not restricted)
+        current_urban = self.historical_analysis['urban_2025'] if self.landcovers.arr_lc3 is not None else self.historical_analysis['urban_2015']
+        
+        # Get restricted areas (assuming restricted factor is at index 5 in the factors)
+        restricted_areas = self.factors.gf[5] > 0.5  # Threshold for restricted areas
+        
+        # Get convertible land excluding restricted areas
+        convertible_land = np.sum((np.isin(self.landcovers.arr_lc2, [2, 4])) & ~restricted_areas)
+        
+        # Conservative estimate: 70% of convertible land + current urban (reduced from 80% to be more conservative)
+        capacity = current_urban + int(convertible_land * 0.7)
+        
+        # Don't exceed 60% of total area (realistic urban limit)
+        max_capacity = int(self.row * self.col * 0.6)
+        return min(capacity, max_capacity)
+
+    def _calculate_sustainable_growth(self, current_urban, target_year):
+        """Calculate sustainable growth based on historical trends and capacity"""
+        years_from_base = target_year - 2025
+        
+        # Base growth from historical rate
+        base_growth = self.annual_growth_rate * self.row * self.col * years_from_base
+        
+        # Apply momentum
+        momentum_adjustment = 1 + (self.growth_momentum * years_from_base / 10)
+        adjusted_growth = base_growth * momentum_adjustment
+        
+        # Ensure we don't exceed capacity
+        max_possible_growth = self.urban_capacity - current_urban
+        sustainable_growth = min(adjusted_growth, max_possible_growth)
+        
+        # Ensure at least minimal growth
+        min_growth = base_growth * 0.3  # At least 30% of historical rate
+        sustainable_growth = max(sustainable_growth, min_growth)
+        
+        return int(sustainable_growth)
+
+    def prepare_training_data(self):
+        print("Preparing training data...")
+        
+        all_X = []
+        all_y = []
+        
+        # First transition period (2005-2015)
+        input_stack_2005 = np.stack([self.landcovers.arr_lc1] +
+                                    [self.factors.gf[i] for i in range(1, self.factors.nFactors + 1)], axis=0)
+        target_2015 = ((self.landcovers.arr_lc2 == 1) & (self.landcovers.arr_lc1 != 1)).astype(np.float32)
+        target_2015 = np.expand_dims(target_2015, axis=0)
+        input_stack_2005 = self.normalize_data(input_stack_2005)
+        X_patches_1, y_patches_1 = self.create_patches(input_stack_2005, target_2015)
+        
+        if X_patches_1.size > 0:
+            all_X.append(X_patches_1)
+            all_y.append(y_patches_1)
+        
+        # Second transition period (2015-2025) if available
+        if self.landcovers.arr_lc3 is not None:
+            input_stack_2015 = np.stack([self.landcovers.arr_lc2] +
+                                        [self.factors.gf[i] for i in range(1, self.factors.nFactors + 1)], axis=0)
+            target_2025 = ((self.landcovers.arr_lc3 == 1) & (self.landcovers.arr_lc2 != 1)).astype(np.float32)
+            target_2025 = np.expand_dims(target_2025, axis=0)
+            input_stack_2015 = self.normalize_data(input_stack_2015)
+            X_patches_2, y_patches_2 = self.create_patches(input_stack_2015, target_2025)
+            if X_patches_2.size > 0:
+                all_X.append(X_patches_2)
+                all_y.append(y_patches_2)
+        
+        if len(all_X) == 0:
+            raise ValueError("No patches were created from any transition. Check inputs and patch size.")
+        
+        X_patches = np.concatenate(all_X, axis=0)
+        y_patches = np.concatenate(all_y, axis=0)
+        
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_patches, y_patches, test_size=0.2, random_state=42
+        )
+        
+        return X_train, X_val, y_train, y_val
+
+    def normalize_data(self, data):
+        normalized_data = np.zeros_like(data, dtype=np.float32)
+        for i in range(data.shape[0]):
+            channel_data = data[i].astype(np.float32)
+            mean = np.mean(channel_data)
+            std = np.std(channel_data)
+            if std > 0:
+                normalized_data[i] = (channel_data - mean) / std
+            else:
+                normalized_data[i] = channel_data - mean
+        return normalized_data
+
+    def create_patches(self, input_data, target_data):
+        patches = []
+        target_patches = []
+        num_patches_x = self.row // self.patch_size
+        num_patches_y = self.col // self.patch_size
+        
+        for i in range(num_patches_x):
+            for j in range(num_patches_y):
+                patch = input_data[:,
+                        i * self.patch_size:(i + 1) * self.patch_size,
+                        j * self.patch_size:(j + 1) * self.patch_size
+                        ]
+                target_patch = target_data[:,
+                               i * self.patch_size:(i + 1) * self.patch_size,
+                               j * self.patch_size:(j + 1) * self.patch_size
+                               ]
+                
+                # More selective patch inclusion for balanced training
+                urban_pixels = np.sum(target_patch)
+                total_pixels = target_patch.size
+                urban_ratio = urban_pixels / total_pixels
+                
+                # Include patches with urban growth or random sampling for diversity
+                if urban_ratio > 0.01 or np.random.random() > 0.9:
+                    patches.append(patch)
+                    target_patches.append(target_patch)
+        
+        if len(patches) == 0:
+            return np.empty((0, input_data.shape[0], self.patch_size, self.patch_size), dtype=np.float32), \
+                   np.empty((0, 1, self.patch_size, self.patch_size), dtype=np.float32)
+        
+        return np.array(patches, dtype=np.float32), np.array(target_patches, dtype=np.float32)
+
+    def create_patches_for_prediction(self, input_data):
+        patches = []
+        positions = []
+        num_patches_x = self.row // self.patch_size
+        num_patches_y = self.col // self.patch_size
+        
+        for i in range(num_patches_x):
+            for j in range(num_patches_y):
+                patch = input_data[:,
+                        i * self.patch_size:(i + 1) * self.patch_size,
+                        j * self.patch_size:(j + 1) * self.patch_size
+                        ]
+                patches.append(patch)
+                positions.append((i, j))
+        
+        return np.array(patches, dtype=np.float32), positions, num_patches_x, num_patches_y
+
+    def build_model(self):
+        input_channels = self.factors.nFactors + 1
+        self.model = CAGANTransformerModel(input_channels, self.patch_size, use_gan=self.use_gan).to(device)
+        print(f"Model built with {input_channels} input channels")
+        
+        # Print model size
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Total parameters: {total_params:,}")
+        
+        # Loss functions
+        self.criterion_bce = nn.BCELoss()
+        self.criterion_mse = nn.MSELoss()
+        
+        # Optimizers
+        self.optimizer_g = optim.AdamW(self.model.generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+        if self.use_gan:
+            self.optimizer_d = optim.AdamW(self.model.discriminator.parameters(), lr=0.0001, betas=(0.5, 0.999))
+        
+        # Schedulers
+        self.scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer_g, patience=5, factor=0.5, verbose=True)
+        if self.use_gan:
+            self.scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer_d, patience=5, factor=0.5, verbose=True)
+
+    def train(self, epochs=100, batch_size=8, lambda_adv=0.1, lambda_fm=10.0):
+        X_train, X_val, y_train, y_val = self.prepare_training_data()
+        print(f"Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
+        
+        if len(X_train) == 0:
+            raise ValueError("No training patches were generated.")
+        
+        train_dataset = UrbanExpansionDataset(X_train, y_train)
+        val_dataset = UrbanExpansionDataset(X_val, y_val)
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                                  pin_memory=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                pin_memory=True, num_workers=0)
+        
+        history = {
+            'train_loss_g': [], 'train_loss_d': [], 'val_loss': [],
+            'train_acc': [], 'val_acc': [], 'd_real': [], 'd_fake': []
+        }
+        
+        # Early stopping parameters
+        best_val_loss = float('inf')
+        patience = 15
+        patience_counter = 0
+        
+        for epoch in range(epochs):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Training phase
+            self.model.train()
+            train_loss_g = 0.0
+            train_loss_d = 0.0
+            train_acc = 0.0
+            d_real_acc = 0.0
+            d_fake_acc = 0.0
+            train_batches = 0
+            
+            for batch_idx, (batch_X, batch_y) in enumerate(train_loader):
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                
+                # ====================
+                # Train Discriminator (if GAN is enabled)
+                # ====================
+                if self.use_gan:
+                    self.optimizer_d.zero_grad()
+                    
+                    # Real samples
+                    real_labels = torch.ones(batch_X.size(0), 1).to(device)
+                    d_real_output = self.model.discriminator(batch_y, batch_X)
+                    d_loss_real = self.criterion_mse(d_real_output, real_labels)
+                    
+                    # Fake samples
+                    with torch.no_grad():
+                        fake_samples = self.model.generator(batch_X)
+                    
+                    fake_labels = torch.zeros(batch_X.size(0), 1).to(device)
+                    d_fake_output = self.model.discriminator(fake_samples.detach(), batch_X)
+                    d_loss_fake = self.criterion_mse(d_fake_output, fake_labels)
+                    
+                    # Total discriminator loss
+                    d_loss = (d_loss_real + d_loss_fake) / 2
+                    d_loss.backward()
+                    self.optimizer_d.step()
+                    
+                    train_loss_d += d_loss.item()
+                    
+                    # Discriminator accuracy
+                    d_real_acc += ((d_real_output > 0.5).float() == real_labels).float().mean().item()
+                    d_fake_acc += ((d_fake_output < 0.5).float() == fake_labels).float().mean().item()
+                
+                # ====================
+                # Train Generator
+                # ====================
+                self.optimizer_g.zero_grad()
+                
+                # Generate samples
+                generated = self.model.generator(batch_X)
+                
+                # Reconstruction loss (BCE)
+                bce_loss = self.criterion_bce(generated, batch_y)
+                
+                # Adversarial loss (if GAN is enabled)
+                if self.use_gan:
+                    g_labels = torch.ones(batch_X.size(0), 1).to(device)
+                    g_output = self.model.discriminator(generated, batch_X)
+                    adv_loss = self.criterion_mse(g_output, g_labels)
+                    
+                    # Total generator loss
+                    g_loss = bce_loss + lambda_adv * adv_loss
+                else:
+                    g_loss = bce_loss
+                    adv_loss = torch.tensor(0.0)
+                
+                g_loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.generator.parameters(), max_norm=1.0)
+                
+                self.optimizer_g.step()
+                
+                train_loss_g += g_loss.item()
+                
+                # Accuracy
+                preds = (generated > 0.5).float()
+                train_acc += (preds == batch_y).float().mean().item()
+                train_batches += 1
+                
+                if batch_idx % 10 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Validation phase
+            self.model.eval()
+            val_loss = 0.0
+            val_acc = 0.0
+            val_batches = 0
+            
+            with torch.no_grad():
+                for batch_X, batch_y in val_loader:
+                    batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                    
+                    generated = self.model.generator(batch_X)
+                    loss = self.criterion_bce(generated, batch_y)
+                    
+                    val_loss += loss.item()
+                    preds = (generated > 0.5).float()
+                    val_acc += (preds == batch_y).float().mean().item()
+                    val_batches += 1
+            
+            # Average metrics
+            train_loss_g = train_loss_g / train_batches if train_batches > 0 else 0.0
+            train_loss_d = train_loss_d / train_batches if train_batches > 0 else 0.0
+            train_acc = train_acc / train_batches if train_batches > 0 else 0.0
+            d_real_acc = d_real_acc / train_batches if train_batches > 0 else 0.0
+            d_fake_acc = d_fake_acc / train_batches if train_batches > 0 else 0.0
+            val_loss = val_loss / val_batches if val_batches > 0 else 0.0
+            val_acc = val_acc / val_batches if val_batches > 0 else 0.0
+            
+            # Update schedulers
+            self.scheduler_g.step(val_loss)
+            if self.use_gan:
+                self.scheduler_d.step(train_loss_d)
+            
+            # Store history
+            history['train_loss_g'].append(train_loss_g)
+            history['train_loss_d'].append(train_loss_d)
+            history['val_loss'].append(val_loss)
+            history['train_acc'].append(train_acc)
+            history['val_acc'].append(val_acc)
+            history['d_real'].append(d_real_acc)
+            history['d_fake'].append(d_fake_acc)
+            
+            # Print progress
+            print(f'Epoch {epoch + 1}/{epochs}')
+            print(f'  Generator Loss: {train_loss_g:.4f}, Acc: {train_acc:.4f}')
+            if self.use_gan:
+                print(f'  Discriminator Loss: {train_loss_d:.4f}, Real Acc: {d_real_acc:.4f}, Fake Acc: {d_fake_acc:.4f}')
+            print(f'  Validation Loss: {val_loss:.4f}, Acc: {val_acc:.4f}')
+            
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                # Save best model
+                torch.save({
+                    'generator_state_dict': self.model.generator.state_dict(),
+                    'discriminator_state_dict': self.model.discriminator.state_dict() if self.use_gan else None,
+                    'optimizer_g_state_dict': self.optimizer_g.state_dict(),
+                    'optimizer_d_state_dict': self.optimizer_d.state_dict() if self.use_gan else None,
+                    'epoch': epoch,
+                    'val_loss': val_loss,
+                }, 'best_model_gan_transformer.pth')
+                print(f"  New best model saved with val_loss: {val_loss:.4f}")
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= patience:
+                print(f"  Early stopping at epoch {epoch + 1}")
+                break
+            
+            # Save checkpoint every 10 epochs
+            if (epoch + 1) % 10 == 0:
+                torch.save({
+                    'epoch': epoch,
+                    'generator_state_dict': self.model.generator.state_dict(),
+                    'discriminator_state_dict': self.model.discriminator.state_dict() if self.use_gan else None,
+                    'optimizer_g_state_dict': self.optimizer_g.state_dict(),
+                    'optimizer_d_state_dict': self.optimizer_d.state_dict() if self.use_gan else None,
+                    'loss': train_loss_g,
+                }, f'checkpoint_epoch_{epoch + 1}.pth')
+        
+        # Load best model for final use
+        if os.path.exists('best_model_gan_transformer.pth'):
+            checkpoint = torch.load('best_model_gan_transformer.pth')
+            self.model.generator.load_state_dict(checkpoint['generator_state_dict'])
+            if self.use_gan and checkpoint['discriminator_state_dict'] is not None:
+                self.model.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+            print("Loaded best model for final evaluation")
+        
+        # Save final model
+        torch.save({
+            'generator_state_dict': self.model.generator.state_dict(),
+            'discriminator_state_dict': self.model.discriminator.state_dict() if self.use_gan else None,
+        }, 'final_model_gan_transformer.pth')
+        
+        return history
+
+    def predict_next_year(self, current_landcover, target_growth=None):
+        """Predict next year with controlled growth using CA principles"""
+        original_landcover = current_landcover.copy().astype(np.int32)
+        
+        input_stack = np.stack([current_landcover] +
+                               [self.factors.gf[i] for i in range(1, self.factors.nFactors + 1)], axis=0)
+        input_stack = self.normalize_data(input_stack)
+        patches, positions, num_patches_x, num_patches_y = self.create_patches_for_prediction(input_stack)
+        
+        if patches.size == 0:
+            raise ValueError("No patches created for prediction.")
+        
+        self.model.generator.eval()
+        predictions = []
+        
+        with torch.no_grad():
+            for i in range(0, len(patches), 8):
+                batch = torch.FloatTensor(patches[i:i + 8]).to(device)
+                pred = self.model.generator(batch)
+                predictions.append(pred.cpu().numpy())
+                
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        predictions = np.concatenate(predictions, axis=0)
+        urban_expansion_prob = self.reconstruct_from_patches(predictions, positions, num_patches_x, num_patches_y)
+        
+        # Apply cellular automata constraints
+        urban_expansion = self._apply_ca_constraints(urban_expansion_prob, original_landcover, target_growth)
+        
+        next_landcover = original_landcover.copy()
+        next_landcover[urban_expansion == 1] = 1
+        
+        # Preserve water bodies
+        water_mask = original_landcover == 3
+        next_landcover[water_mask] = 3
+        
+        current_urban = np.sum(original_landcover == 1)
+        new_urban = np.sum(next_landcover == 1)
+        growth = new_urban - current_urban
+        
+        print(f"Urban cells before: {current_urban}")
+        print(f"Urban cells after: {new_urban}")
+        print(f"New urban conversions: {growth}")
+        if target_growth:
+            print(f"Target growth: {target_growth}, Actual growth: {growth}")
+        
+        return next_landcover.astype(np.int32), urban_expansion_prob
+
+    def _apply_ca_constraints(self, probability_map, current_landcover, target_growth=None):
+        """Apply cellular automata constraints for realistic urban growth"""
+        from scipy import ndimage
+        
+        # Basic constraints
+        convertible_mask = np.isin(current_landcover, [2, 4])  # Only certain classes can convert
+        
+        # Get restricted areas (assuming restricted factor is at index 5 in the factors)
+        restricted_areas = self.factors.gf[5] > 0.5  # Threshold for restricted areas
+        
+        # Exclude restricted areas from conversion
+        convertible_mask = convertible_mask & ~restricted_areas
+        
+        urban_mask = (current_landcover == 1).astype(float)
+        
+        # Cellular automata: proximity to existing urban areas
+        proximity_to_urban = ndimage.distance_transform_edt(1 - urban_mask)
+        
+        # Enhanced proximity factor with distance decay
+        base_distance = 8  # Reduced from 10 for better local accuracy
+        proximity_factor = np.exp(-proximity_to_urban / base_distance)
+        
+        # Neighborhood density (3x3 kernel)
+        kernel = np.ones((3, 3))
+        urban_density = ndimage.convolve(urban_mask, kernel) / 8  # Normalize
+        
+        # Combine factors - ADJUSTED weights for better accuracy
+        adjusted_probabilities = probability_map * proximity_factor * (1 + urban_density * 0.6)  # Increased weight
+        
+        # Apply adaptive threshold based on target growth
+        if target_growth is None:
+            # Use historical growth rate if no target specified
+            target_growth = int(self.annual_growth_rate * self.row * self.col)
+        
+        # Limit growth to target with adaptive threshold
+        expansion_mask = convertible_mask & (adjusted_probabilities > 0.4)  # Lower threshold
+        
+        if np.sum(expansion_mask) > target_growth:
+            expansion_probs = adjusted_probabilities[expansion_mask]
+            if len(expansion_probs) > 0:
+                threshold = np.percentile(expansion_probs, 100 * (1 - target_growth / np.sum(expansion_mask)))
+                expansion_mask = expansion_mask & (adjusted_probabilities >= threshold)
+        elif np.sum(expansion_mask) < target_growth * 0.8:  # If we're missing growth, lower threshold
+            expansion_mask = convertible_mask & (adjusted_probabilities > 0.3)
+            if np.sum(expansion_mask) > target_growth:
+                expansion_probs = adjusted_probabilities[expansion_mask]
+                if len(expansion_probs) > 0:
+                    threshold = np.percentile(expansion_probs, 100 * (1 - target_growth / np.sum(expansion_mask)))
+                    expansion_mask = expansion_mask & (adjusted_probabilities >= threshold)
+        
+        urban_expansion = np.zeros_like(probability_map, dtype=np.int32)
+        urban_expansion[expansion_mask] = 1
+        
+        return urban_expansion
+
+    def reconstruct_from_patches(self, patches, positions, num_patches_x, num_patches_y):
+        reconstructed = np.zeros((self.row, self.col), dtype=np.float32)
+        for idx, (i, j) in enumerate(positions):
+            reconstructed[
+            i * self.patch_size:(i + 1) * self.patch_size,
+            j * self.patch_size:(j + 1) * self.patch_size
+            ] = patches[idx, 0]
+        return reconstructed
+
+    def evaluate(self, actual_2025):
+        """Evaluate model by predicting 2025 from 2015 and comparing with actual 2025"""
+        print("\n=== EVALUATING MODEL (2015 -> 2025) ===")
+        
+        # Use 2015 data to predict 2025
+        predicted_2025, _ = self.predict_next_year(self.landcovers.arr_lc2)
+        
+        actual_2025 = actual_2025.astype(np.int32)
+        predicted_2025 = predicted_2025.astype(np.int32)
+        
+        # Calculate urban areas
+        actual_urban = (actual_2025 == 1).astype(np.int32)
+        predicted_urban = (predicted_2025 == 1).astype(np.int32)
+        
+        # Create evaluation mask (exclude water and areas that were already urban in 2015)
+        eval_mask = (self.landcovers.arr_lc2 != 3) & (self.landcovers.arr_lc2 != 1)
+        actual_flat = actual_urban[eval_mask].flatten()
+        predicted_flat = predicted_urban[eval_mask].flatten()
+        
+        if actual_flat.size == 0:
+            raise ValueError("No pixels available for evaluation.")
+        
+        # Calculate metrics
+        accuracy = accuracy_score(actual_flat, predicted_flat)
+        f1 = f1_score(actual_flat, predicted_flat, zero_division=0)
+        iou = jaccard_score(actual_flat, predicted_flat, zero_division=0)
+        
+        # Calculate change detection metrics
+        observed_change = ((actual_2025 == 1) & (self.landcovers.arr_lc2 != 1)).astype(np.int32)
+        predicted_change = ((predicted_2025 == 1) & (self.landcovers.arr_lc2 != 1)).astype(np.int32)
+        
+        observed_change_eval = observed_change[eval_mask].flatten()
+        predicted_change_eval = predicted_change[eval_mask].flatten()
+        
+        hits = int(np.sum((observed_change_eval == 1) & (predicted_change_eval == 1)))
+        misses = int(np.sum((observed_change_eval == 1) & (predicted_change_eval == 0)))
+        false_alarms = int(np.sum((observed_change_eval == 0) & (predicted_change_eval == 1)))
+        correct_rejections = int(np.sum((observed_change_eval == 0) & (predicted_change_eval == 0)))
+        total_eval_pixels = int(np.sum(eval_mask))
+        
+        # Figure of Merit calculation
+        denom_fom = (hits + misses + false_alarms)
+        fom = hits / denom_fom if denom_fom > 0 else 0.0
+        
+        observed_change_area = int(np.sum(observed_change_eval))
+        predicted_change_area = int(np.sum(predicted_change_eval))
+        qd = abs(predicted_change_area - observed_change_area) / total_eval_pixels if total_eval_pixels > 0 else 0.0
+        ad = 2 * min(misses, false_alarms) / total_eval_pixels if total_eval_pixels > 0 else 0.0
+        
+        # Additional metrics
+        precision = hits / (hits + false_alarms) if (hits + false_alarms) > 0 else 0.0
+        recall = hits / (hits + misses) if (hits + misses) > 0 else 0.0
+        
+        print(f"\n=== EVALUATION RESULTS ===")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        print(f"IoU: {iou:.4f}")
+        print(f"Figure of Merit (FoM): {fom:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"Allocation Disagreement (AD): {ad:.4f}")
+        print(f"Quantity Disagreement (QD): {qd:.4f}")
+        
+        print(f"\n=== CONFUSION MATRIX FOR CHANGE DETECTION ===")
+        print(f"Hits (True Positives): {hits}")
+        print(f"Misses (False Negatives): {misses}")
+        print(f"False Alarms (False Positives): {false_alarms}")
+        print(f"Correct Rejections (True Negatives): {correct_rejections}")
+        print(f"Total Evaluation Pixels: {total_eval_pixels}")
+        
+        print(f"\n=== CHANGE AREAS ===")
+        print(f"Observed Change Area: {observed_change_area} pixels")
+        print(f"Predicted Change Area: {predicted_change_area} pixels")
+        print(f"Urban Area 2015: {np.sum(self.landcovers.arr_lc2 == 1)} pixels")
+        print(f"Urban Area 2025 (Actual): {np.sum(actual_2025 == 1)} pixels")
+        print(f"Urban Area 2025 (Predicted): {np.sum(predicted_2025 == 1)} pixels")
+        
+        self.last_eval_metrics = {
+            'accuracy': float(accuracy),
+            'f1': float(f1),
+            'iou': float(iou),
+            'FoM': float(fom),
+            'precision': float(precision),
+            'recall': float(recall),
+            'AllocationDisagreement': float(ad),
+            'QuantityDisagreement': float(qd),
+            'hits': hits,
+            'misses': misses,
+            'false_alarms': false_alarms,
+            'correct_rejections': correct_rejections,
+            'observed_change_area': observed_change_area,
+            'predicted_change_area': predicted_change_area,
+            'total_eval_pixels': total_eval_pixels
+        }
+        
+        return accuracy, f1, iou, predicted_2025
+
+    def simulate_future(self, start_year, target_years=[2035, 2045]):
+        """Simulate urban expansion for specific target years with realistic growth"""
+        current_landcover = start_year.copy().astype(np.int32)
+        predictions = {}
+        probability_maps = {}
+        
+        current_urban = np.sum(current_landcover == 1)
+        print(f"\nStarting simulation from 2025 with {current_urban} urban pixels")
+        print(f"Target years: {target_years}")
+        print(f"Urban capacity: {self.urban_capacity} pixels")
+        
+        for target_year in target_years:
+            years_ahead = target_year - 2025
+            print(f"\n=== Simulating {target_year} ({years_ahead} years ahead) ===")
+            
+            # Calculate sustainable growth for this period
+            target_growth = self._calculate_sustainable_growth(current_urban, target_year)
+            annual_growth = target_growth // years_ahead
+            
+            print(f"Target growth for {target_year}: {target_growth} pixels")
+            print(f"Average annual growth: {annual_growth} pixels")
+            
+            # Simulate year by year with controlled growth
+            for year in range(1, years_ahead + 1):
+                current_landcover, prob_map = self.predict_next_year(current_landcover, target_growth=annual_growth)
+                current_urban = np.sum(current_landcover == 1)
+                print(f"  Year {2025 + year}: {current_urban} urban pixels")
+            
+            predictions[target_year] = current_landcover.copy()
+            probability_maps[target_year] = prob_map.copy()
+            
+            print(f"Final urban area for {target_year}: {current_urban} pixels")
+            print(f"Growth from 2025: {current_urban - np.sum(start_year == 1)} pixels")
+        
+        return predictions, probability_maps
+
+    def run_advanced_experiments(self, X_val, y_val):
+        print("\n" + "=" * 80)
+        print("RUNNING ADVANCED EXPERIMENTS")
+        print("=" * 80)
+        
+        self.experiment_results = {}
+        
+        print("\n>>> EXPERIMENT 1: HISTORICAL TREND ANALYSIS <<<")
+        trend_analysis = self._analyze_historical_trends()
+        self.experiment_results['trend_analysis'] = trend_analysis
+        
+        print("\n>>> EXPERIMENT 2: VARIABLE IMPORTANCE <<<")
+        var_importance = self.analyze_variable_importance(X_val, y_val)
+        self.experiment_results['variable_importance'] = var_importance
+        
+        print("\n>>> EXPERIMENT 3: SPATIAL PATTERNS <<<")
+        spatial_patterns = self.analyze_spatial_patterns()
+        self.experiment_results['spatial_patterns'] = spatial_patterns
+        
+        self.print_experiment_summary()
+        return self.experiment_results
+
+    def _analyze_historical_trends(self):
+        """Comprehensive analysis of historical urban growth trends"""
+        trends = {}
+        
+        # Urban growth rates
+        urban_2005 = self.historical_analysis['urban_2005']
+        urban_2015 = self.historical_analysis['urban_2015']
+        
+        growth_2005_2015 = urban_2015 - urban_2005
+        annual_growth_2005_2015 = growth_2005_2015 / 10
+        
+        trends['growth_2005_2015'] = growth_2005_2015
+        trends['annual_growth_2005_2015'] = annual_growth_2005_2015
+        
+        if self.landcovers.arr_lc3 is not None:
+            urban_2025 = self.historical_analysis['urban_2025']
+            growth_2015_2025 = urban_2025 - urban_2015
+            annual_growth_2015_2025 = growth_2015_2025 / 10
+            
+            trends['growth_2015_2025'] = growth_2015_2025
+            trends['annual_growth_2015_2025'] = annual_growth_2015_2025
+            trends['growth_acceleration'] = annual_growth_2015_2025 - annual_growth_2005_2015
+        
+        # Growth percentages
+        total_area = self.row * self.col
+        trends['urban_percentage_2005'] = (urban_2005 / total_area) * 100
+        trends['urban_percentage_2015'] = (urban_2015 / total_area) * 100
+        if self.landcovers.arr_lc3 is not None:
+            trends['urban_percentage_2025'] = (urban_2025 / total_area) * 100
+        
+        return trends
+
+    def analyze_variable_importance(self, X_val, y_val):
+        print("  Analyzing variable importance...")
+        feature_names = ['LandCover', 'CBD', 'Road', 'Population', 'Slope', 'Restricted',
+                         'Amenity', 'Commercial', 'Industrial', 'NTL']
+        importance_scores = {}
+        
+        with torch.no_grad():
+            X_val_tensor = torch.FloatTensor(X_val).to(device)
+            predictions = self.model.generator(X_val_tensor).cpu().numpy().flatten()
+        
+        for i, factor_name in enumerate(feature_names):
+            factor_values = X_val[:, i].flatten()
+            try:
+                correlation = np.corrcoef(factor_values, predictions)[0, 1]
+            except Exception:
+                correlation = 0.0
+            if np.isnan(correlation):
+                correlation = 0.0
+            importance_scores[factor_name] = float(correlation)
+            print(f"    {factor_name}: {correlation:.4f}")
+        
+        return importance_scores
+
+    def analyze_spatial_patterns(self):
+        """Analyze spatial patterns of urban growth"""
+        patterns = {}
+        
+        # Cluster analysis
+        clustering = self.historical_analysis['spatial_clustering']
+        patterns['clustering'] = clustering
+        
+        # Growth direction
+        direction = self.historical_analysis['growth_direction']
+        patterns['growth_direction'] = direction
+        
+        # Land cover transitions
+        patterns['transitions_2005_2015'] = self.historical_analysis['transitions_2005_2015']
+        if self.landcovers.arr_lc3 is not None:
+            patterns['transitions_2015_2025'] = self.historical_analysis['transitions_2015_2025']
+        
+        return patterns
+
+    def print_experiment_summary(self):
+        print("\n" + "=" * 80)
+        print("EXPERIMENT SUMMARY (Enhanced CA+GAN+Transformer)")
+        print("=" * 80)
+        
+        if self.last_eval_metrics:
+            print("\nEVALUATION METRICS:")
+            print(f"  Accuracy: {self.last_eval_metrics['accuracy']:.4f}")
+            print(f"  F1 Score: {self.last_eval_metrics['f1']:.4f}")
+            print(f"  IoU: {self.last_eval_metrics['iou']:.4f}")
+            print(f"  FoM: {self.last_eval_metrics['FoM']:.4f}")
+            print(f"  Precision: {self.last_eval_metrics['precision']:.4f}")
+            print(f"  Recall: {self.last_eval_metrics['recall']:.4f}")
+        
+        print("\nHISTORICAL TRENDS:")
+        trends = self.experiment_results['trend_analysis']
+        print(f"  Urban 2005: {self.historical_analysis['urban_2005']} pixels ({trends['urban_percentage_2005']:.2f}%)")
+        print(f"  Urban 2015: {self.historical_analysis['urban_2015']} pixels ({trends['urban_percentage_2015']:.2f}%)")
+        if self.landcovers.arr_lc3 is not None:
+            print(f"  Urban 2025: {self.historical_analysis['urban_2025']} pixels ({trends['urban_percentage_2025']:.2f}%)")
+            print(f"  Growth acceleration: {trends.get('growth_acceleration', 0):.0f} pixels/year")
+        
+        print("\n" + "=" * 80)
+
+
+def exportPredicted(array, outFileName, template_ds):
+    driver = gdal.GetDriverByName("GTiff")
+    outdata = driver.Create(outFileName, template_ds.RasterXSize, template_ds.RasterYSize, 1, gdal.GDT_Int16)
+    outdata.SetGeoTransform(template_ds.GetGeoTransform())
+    outdata.SetProjection(template_ds.GetProjection())
+    array_int = array.astype(np.int16)
+    outdata.GetRasterBand(1).WriteArray(array_int)
+    outdata.GetRasterBand(1).SetNoDataValue(0)
+    outdata.FlushCache()
+    outdata = None
+    print(f"Exported {outFileName}")
+
+
+def plot_urban_growth_trend(historical, predictions, urban_capacity):
+    """Plot comprehensive urban growth trend"""
+    years = list(historical.keys())
+    urban_areas = list(historical.values())
+    
+    # Add predictions
+    pred_years = list(predictions.keys())
+    pred_areas = list(predictions.values())
+    
+    plt.figure(figsize=(14, 8))
+    
+    # Plot historical and predicted trends
+    plt.subplot(2, 2, 1)
+    all_years = years + pred_years
+    all_areas = urban_areas + pred_areas
+    plt.plot(all_years, all_areas, 'bo-', linewidth=2, markersize=8, label='Urban Area')
+    plt.axhline(y=urban_capacity, color='r', linestyle='--', label='Urban Capacity')
+    plt.xlabel('Year')
+    plt.ylabel('Urban Area (pixels)')
+    plt.title('Urban Growth Trend')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    # Plot growth rates
+    plt.subplot(2, 2, 2)
+    growth_rates = []
+    growth_years = []
+    for i in range(1, len(all_years)):
+        growth = all_areas[i] - all_areas[i - 1]
+        years_interval = all_years[i] - all_years[i - 1]
+        annual_growth = growth / years_interval
+        growth_rates.append(annual_growth)
+        growth_years.append(all_years[i])
+    
+    plt.bar(growth_years, growth_rates, alpha=0.7)
+    plt.xlabel('Year')
+    plt.ylabel('Annual Growth (pixels)')
+    plt.title('Annual Urban Growth')
+    plt.grid(True, alpha=0.3)
+    
+    # Plot urban percentage
+    plt.subplot(2, 2, 3)
+    total_area = urban_areas[0] / (historical[2005] / 100)  # Estimate total area
+    urban_percentages = [area / total_area * 100 for area in all_areas]
+    plt.plot(all_years, urban_percentages, 'go-', linewidth=2, markersize=6)
+    plt.xlabel('Year')
+    plt.ylabel('Urban Area (%)')
+    plt.title('Urban Area Percentage')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('comprehensive_urban_growth.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def plot_gan_training_history(history):
+    """Plot GAN training history"""
+    plt.figure(figsize=(15, 10))
+    
+    # Plot losses
+    plt.subplot(2, 3, 1)
+    plt.plot(history['train_loss_g'], label='Generator Loss')
+    if 'train_loss_d' in history and history['train_loss_d']:
+        plt.plot(history['train_loss_d'], label='Discriminator Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title('Loss Progression')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot accuracy
+    plt.subplot(2, 3, 2)
+    plt.plot(history['train_acc'], label='Train Accuracy')
+    plt.plot(history['val_acc'], label='Val Accuracy')
+    plt.title('Accuracy Progression')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot discriminator accuracy
+    if 'd_real' in history and history['d_real']:
+        plt.subplot(2, 3, 3)
+        plt.plot(history['d_real'], label='Real Accuracy')
+        plt.plot(history['d_fake'], label='Fake Accuracy')
+        plt.title('Discriminator Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+    
+    # Plot learning rate progression (if available)
+    plt.subplot(2, 3, 4)
+    if 'train_loss_g' in history:
+        plt.plot(history['train_loss_g'], label='Generator Loss', alpha=0.7)
+    if 'val_loss' in history:
+        plt.plot(history['val_loss'], label='Validation Loss', alpha=0.7)
+    plt.title('Generator vs Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('gan_training_history.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+if __name__ == "__main__":
+    # Set environment variable for memory optimization
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+    
+    file_2005 = "DataColombo/2015_cleaned.tif"  # Actually 2005
+    file_2015 = "DataColombo/2020_cleaned.tif"  # Actually 2015
+    file_2025 = "DataColombo/2025_cleaned.tif"  # Actually 2025
+    
+    # Original factors
+    cbd = "DataColombo/CBD_cleaned (1).tif"
+    road = "DataColombo/road_cleaned.tif"
+    restricted = "DataColombo/restricted_cleaned.tif"
+    pop24 = "DataColombo/pop_cleaned.tif"
+    slope = "DataColombo/slope_cleaned.tif"
+    amenity = "DataColombo/amenitykernel_cleaned.tif"
+    commercial = "DataColombo/commercialkernel_cleaned.tif"
+    industrial = "DataColombo/industrailkernel_cleaned.tif"
+    ntl = "DataColombo/ntl_cleaned.tif"
+    
+    print("=== Loading Data ===")
+    myLandcover = LandCoverData(file_2005, file_2015, file_2025)
+    
+    # Include all factors (original + new)
+    myFactors = GrowthFactors(cbd, road, pop24, slope, restricted,
+                              amenity, commercial, industrial, ntl)
+    
+    print("\n=== Initializing Enhanced CA+GAN+Transformer Model ===")
+    # Set use_gan=True to enable GAN training
+    dl_ca_model = DeepLearningCA(myLandcover, myFactors, patch_size=64, use_gan=True)
+    dl_ca_model.build_model()
+    
+    print("\n=== Preparing Data ===")
+    X_train, X_val, y_train, y_val = dl_ca_model.prepare_training_data()
+    
+    print("\n=== Training Model ===")
+    start_time = time.time()
+    history = dl_ca_model.train(epochs=100, batch_size=8, lambda_adv=0.1, lambda_fm=10.0)
+    end_time = time.time()
+    print(f"Training time: {(end_time - start_time) / 60:.2f} minutes")
+    
+    print("\n=== Evaluating Model (2015 -> 2025) ===")
+    # Use 2015 to predict 2025 and compare with actual 2025
+    accuracy, f1, iou, predicted_2025 = dl_ca_model.evaluate(myLandcover.arr_lc3)
+    exportPredicted(predicted_2025, 'predicted_2025_gan_transformer.tif', myLandcover.ds_lc1)
+    
+    print("\n=== Running Experiments ===")
+    experiment_results = dl_ca_model.run_advanced_experiments(X_val, y_val)
+    
+    print("\n=== Simulating Future (2035 and 2045) ===")
+    start_year = myLandcover.arr_lc3  # Use 2025 as starting point
+    
+    # Simulate specific target years with controlled growth
+    future_predictions, probability_maps = dl_ca_model.simulate_future(start_year, target_years=[2035, 2045])
+    
+    # Export future predictions
+    for year, prediction in future_predictions.items():
+        exportPredicted(prediction, f'predicted_{year}_gan_transformer.tif', myLandcover.ds_lc1)
+        print(f"{year} urban area: {np.sum(prediction == 1)} pixels")
+    
+    # Plot comprehensive urban growth trend
+    historical_growth = {
+        2005: np.sum(myLandcover.arr_lc1 == 1),
+        2015: np.sum(myLandcover.arr_lc2 == 1),
+        2025: np.sum(myLandcover.arr_lc3 == 1)
+    }
+    
+    predicted_growth = {}
+    for year, pred in future_predictions.items():
+        predicted_growth[year] = np.sum(pred == 1)
+    
+    plot_urban_growth_trend(historical_growth, predicted_growth, dl_ca_model.urban_capacity)
+    
+    # Plot GAN training history
+    plot_gan_training_history(history)
+    
+    print("\n=== COMPLETED SUCCESSFULLY ===")
+    print("\nEnhanced GAN+Transformer Model Features:")
+    print("  - Generator with encoder-decoder architecture and attention mechanisms")
+    print("  - Discriminator with fixed output size (1x1) for proper training")
+    print("  - Transformer blocks in bottleneck for long-range dependencies")
+    print("  - Adversarial training for realistic urban patterns")
+    print("  - Simplified training with MSE loss for discriminator")
+    print("  - 10 input variables including new factors (amenity, commercial, industrial, NTL)")
+    print("  - Historical trend analysis (2005, 2015, 2025)")
+    print("  - Cellular automata constraints with restricted area protection")
+    print("  - Sustainable growth calculations")
+    print("  - Urban capacity estimation excluding restricted areas")
+    print("  - Growth momentum analysis")
+    print("  - Realistic growth pattern enforcement")
+    print(f"  - Future projections: 2035 and 2045 with controlled growth")
