@@ -1,0 +1,733 @@
+import os
+import math
+import numpy as np
+from osgeo import gdal
+import time
+import joblib
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVR
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from scipy import ndimage
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# Utility functions (unchanged)
+# ============================================================================
+
+def readraster(file):
+    """Read raster file and handle NoData values properly"""
+    dataSource = gdal.Open(file)
+    if dataSource is None:
+        raise FileNotFoundError(f"Unable to open raster: {file}")
+    band = dataSource.GetRasterBand(1)
+    band_array = band.ReadAsArray()
+
+    # Get NoData value
+    nodata = band.GetNoDataValue()
+    if nodata is not None:
+        band_array = np.where(band_array == nodata, np.nan, band_array)
+
+    # Also replace extreme values that might be NoData
+    band_array = np.where(band_array < -1e10, np.nan, band_array)
+    band_array = np.where(band_array > 1e10, np.nan, band_array)
+
+    return dataSource, band_array
+
+def identicalList(inList):
+    inList = np.array(inList)
+    if len(inList) == 0:
+        return True
+    logical = inList == inList[0]
+    return bool(np.all(logical))
+
+# ============================================================================
+# Data classes (unchanged)
+# ============================================================================
+
+class LSTData:
+    def __init__(self, lst_files, landuse_files, ndvi_files, emissivity_files):
+        # Load LST data
+        self.ds_lst1, self.arr_lst1 = readraster(lst_files[0])
+        self.ds_lst2, self.arr_lst2 = readraster(lst_files[1])
+        self.ds_lst3, self.arr_lst3 = readraster(lst_files[2])
+
+        # Load land use data
+        self.ds_lu1, self.arr_lu1 = readraster(landuse_files[0])
+        self.ds_lu2, self.arr_lu2 = readraster(landuse_files[1])
+        self.ds_lu3, self.arr_lu3 = readraster(landuse_files[2])
+
+        # Load NDVI data
+        self.ds_ndvi1, self.arr_ndvi1 = readraster(ndvi_files[0])
+        self.ds_ndvi2, self.arr_ndvi2 = readraster(ndvi_files[1])
+        self.ds_ndvi3, self.arr_ndvi3 = readraster(ndvi_files[2])
+
+        # Load emissivity data
+        self.ds_emiss1, self.arr_emiss1 = readraster(emissivity_files[0])
+        self.ds_emiss2, self.arr_emiss2 = readraster(emissivity_files[1])
+        self.ds_emiss3, self.arr_emiss3 = readraster(emissivity_files[2])
+
+        # Clean the data
+        self._clean_data()
+        self.performChecks()
+
+    def _clean_data(self):
+        """Clean and validate the input data"""
+        print("Cleaning and validating data...")
+        for arr in [self.arr_lst1, self.arr_lst2, self.arr_lst3]:
+            arr[arr < -50] = np.nan
+            arr[arr > 60] = np.nan
+        for arr in [self.arr_ndvi1, self.arr_ndvi2, self.arr_ndvi3]:
+            arr[arr < -1] = np.nan
+            arr[arr > 1] = np.nan
+        for arr in [self.arr_emiss1, self.arr_emiss2, self.arr_emiss3]:
+            arr[arr < 0] = np.nan
+            arr[arr > 1] = np.nan
+        for arr in [self.arr_lu1, self.arr_lu2, self.arr_lu3]:
+            arr[~np.isfinite(arr)] = 0
+            arr = arr.astype(np.int32)
+
+    def performChecks(self):
+        print("Checking the size of input rasters...")
+        datasets = [
+            self.ds_lst1, self.ds_lst2, self.ds_lst3,
+            self.ds_lu1, self.ds_lu2, self.ds_lu3,
+            self.ds_ndvi1, self.ds_ndvi2, self.ds_ndvi3,
+            self.ds_emiss1, self.ds_emiss2, self.ds_emiss3
+        ]
+        rows = [ds.RasterYSize for ds in datasets]
+        cols = [ds.RasterXSize for ds in datasets]
+        if identicalList(rows) and identicalList(cols):
+            print("All raster sizes matched.")
+            self.row, self.col = rows[0], cols[0]
+        else:
+            raise ValueError("Input raster files have different dimensions.")
+        print("\nChecking data ranges...")
+        for year, arr in zip(['2015', '2020', '2025'], [self.arr_lst1, self.arr_lst2, self.arr_lst3]):
+            valid_mask = ~np.isnan(arr)
+            if np.any(valid_mask):
+                print(f"LST {year}: {np.nanmin(arr):.2f} to {np.nanmax(arr):.2f}°C, "
+                      f"Mean={np.nanmean(arr):.2f}°C, Valid pixels={np.sum(valid_mask)}")
+            else:
+                print(f"LST {year}: No valid data")
+
+class LSTFactors:
+    def __init__(self, *args):
+        self.factors = {}
+        self.factors_ds = {}
+        self.nFactors = len(args)
+        factor_names = [
+            'amenity', 'building_density', 'cbd_distance', 'commercial',
+            'industrial', 'ntl', 'population', 'restricted',
+            'road_density', 'road_distance', 'slope'
+        ]
+        for n, file in enumerate(args, 1):
+            self.factors_ds[n], self.factors[n] = readraster(file)
+            self.factors[n] = self._clean_factor(self.factors[n], factor_names[n - 1])
+            print(f"Loaded factor {n}: {factor_names[n - 1]} - range: {np.nanmin(self.factors[n]):.3f} to {np.nanmax(self.factors[n]):.3f}")
+        self.performChecks()
+
+    def _clean_factor(self, factor_data, factor_name):
+        factor_data = np.where(factor_data < -1e10, np.nan, factor_data)
+        factor_data = np.where(factor_data > 1e10, np.nan, factor_data)
+        if factor_name in ['amenity', 'commercial', 'industrial']:
+            factor_data = np.where(factor_data < 0, 0, factor_data)
+        elif factor_name == 'building_density':
+            factor_data = np.where(factor_data < 0, 0, factor_data)
+            if np.nanmax(factor_data) > 10000:
+                factor_data = factor_data / 1000
+        elif factor_name == 'population':
+            factor_data = np.where(factor_data < 0, 0, factor_data)
+        elif factor_name == 'slope':
+            factor_data = np.where(factor_data < 0, 0, factor_data)
+            factor_data = np.where(factor_data > 90, 90, factor_data)
+        return factor_data
+
+    def performChecks(self):
+        print("\nChecking the size of input factors...")
+        rows = []
+        cols = []
+        for n in range(1, self.nFactors + 1):
+            rows.append(self.factors_ds[n].RasterYSize)
+            cols.append(self.factors_ds[n].RasterXSize)
+        if identicalList(rows) and identicalList(cols):
+            print("All factors have same row and column values.")
+            self.row = rows[0]
+            self.col = cols[0]
+        else:
+            raise ValueError("Input factors have different dimensions.")
+
+# ============================================================================
+# Main LST Simulator class (SVM replaced)
+# ============================================================================
+
+class LSTSimulator:
+    def __init__(self, lst_data, lst_factors, window_size=5):  # reduced window for pixel-wise features
+        self.lst_data = lst_data
+        self.factors = lst_factors
+        self.window_size = window_size       # half-size for local feature extraction
+        self.model = None
+        self.scaler_X = None                 # optional feature scaler (we use robust normalization separately)
+        self.scaler_y = None
+        self.last_eval_metrics = None
+        self.experiment_results = {}
+
+        # LST analysis (unchanged)
+        self.lst_statistics = self._analyze_lst_statistics()
+        self.temporal_trends = self._analyze_temporal_trends()
+        self.urban_heat_island = self._analyze_urban_heat_island()
+
+        print("\n=== LST STATISTICAL ANALYSIS ===")
+        for year in ['2015', '2020', '2025']:
+            stats = self.lst_statistics[year]
+            print(f"LST {year}: Mean={stats['mean']:.2f}°C, Std={stats['std']:.2f}, "
+                  f"Range={stats['min']:.2f} to {stats['max']:.2f}°C")
+        if 'warming_rate' in self.temporal_trends:
+            print(f"Average warming rate: {self.temporal_trends['warming_rate']:.4f}°C/year")
+
+    # ---------- Analysis methods (unchanged) ----------
+    def _analyze_lst_statistics(self):
+        stats = {}
+        for year, arr in zip(['2015', '2020', '2025'],
+                             [self.lst_data.arr_lst1, self.lst_data.arr_lst2, self.lst_data.arr_lst3]):
+            valid_mask = ~np.isnan(arr)
+            if np.any(valid_mask):
+                valid_data = arr[valid_mask]
+                stats[year] = {
+                    'mean': np.mean(valid_data), 'std': np.std(valid_data),
+                    'min': np.min(valid_data), 'max': np.max(valid_data),
+                    'median': np.median(valid_data), 'valid_pixels': np.sum(valid_mask)
+                }
+            else:
+                stats[year] = {'mean': 0, 'std': 0, 'min': 0, 'max': 0, 'median': 0, 'valid_pixels': 0}
+        return stats
+
+    def _analyze_temporal_trends(self):
+        trends = {}
+        try:
+            if (self.lst_statistics['2015']['valid_pixels'] > 0 and self.lst_statistics['2020']['valid_pixels'] > 0):
+                trends['warming_2015_2020'] = (self.lst_statistics['2020']['mean'] - self.lst_statistics['2015']['mean']) / 5
+            if (self.lst_statistics['2020']['valid_pixels'] > 0 and self.lst_statistics['2025']['valid_pixels'] > 0):
+                trends['warming_2020_2025'] = (self.lst_statistics['2025']['mean'] - self.lst_statistics['2020']['mean']) / 5
+            valid_rates = [trends.get('warming_2015_2020', 0), trends.get('warming_2020_2025', 0)]
+            valid_rates = [r for r in valid_rates if r != 0]
+            if valid_rates:
+                trends['warming_rate'] = np.mean(valid_rates)
+        except (KeyError, TypeError):
+            trends['warming_rate'] = 0.0
+        return trends
+
+    def _analyze_urban_heat_island(self):
+        uhi_analysis = {}
+        for year, lst_arr, lu_arr in zip(['2015', '2020', '2025'],
+                                         [self.lst_data.arr_lst1, self.lst_data.arr_lst2, self.lst_data.arr_lst3],
+                                         [self.lst_data.arr_lu1, self.lst_data.arr_lu2, self.lst_data.arr_lu3]):
+            lst_by_class = {}
+            for lu_class in [1, 2, 3, 4]:
+                mask = (lu_arr == lu_class) & ~np.isnan(lst_arr)
+                if np.any(mask):
+                    lst_by_class[lu_class] = np.mean(lst_arr[mask])
+                else:
+                    lst_by_class[lu_class] = np.nan
+            uhi_analysis[year] = lst_by_class
+            if (1 in lst_by_class and 2 in lst_by_class and not np.isnan(lst_by_class[1]) and not np.isnan(lst_by_class[2])):
+                uhi_analysis[year]['uhi_intensity'] = lst_by_class[1] - lst_by_class[2]
+        return uhi_analysis
+
+    # ---------- Feature engineering (unchanged) ----------
+    def _create_enhanced_features(self, lu_arr, ndvi_arr, emiss_arr):
+        input_layers = [lu_arr, ndvi_arr, emiss_arr]
+        for i in range(1, self.factors.nFactors + 1):
+            input_layers.append(self.factors.factors[i])
+
+        # Derived features (same as original)
+        if 2 in self.factors.factors:
+            urban_intensity = self.factors.factors[2] * (lu_arr == 1).astype(np.float32)
+            input_layers.append(urban_intensity)
+        vegetation_cooling = ndvi_arr * (lu_arr == 2).astype(np.float32)
+        input_layers.append(vegetation_cooling)
+        if 3 in self.factors.factors:
+            cbd_inverse = 1.0 / (self.factors.factors[3] + 1e-6)
+            input_layers.append(cbd_inverse)
+        if 10 in self.factors.factors:
+            road_inverse = 1.0 / (self.factors.factors[10] + 1e-6)
+            input_layers.append(road_inverse)
+        if 2 in self.factors.factors and 6 in self.factors.factors:
+            urban_heat = self.factors.factors[2] * self.factors.factors[6]
+            input_layers.append(urban_heat)
+        if 11 in self.factors.factors:
+            elevation_effect = np.exp(-self.factors.factors[11] / 45.0)
+            input_layers.append(elevation_effect)
+
+        input_stack = np.stack(input_layers, axis=0)
+        print(f"Created enhanced feature stack with {input_stack.shape[0]} channels")
+        return input_stack
+
+    def normalize_data(self, data):
+        """Robust normalization per channel (same as original)"""
+        normalized_data = np.zeros_like(data, dtype=np.float32)
+        for i in range(data.shape[0]):
+            channel_data = data[i].astype(np.float32)
+            valid_mask = ~np.isnan(channel_data)
+            if np.any(valid_mask):
+                valid_data = channel_data[valid_mask]
+                median = np.median(valid_data)
+                q75, q25 = np.percentile(valid_data, [75, 25])
+                iqr = q75 - q25
+                if iqr > 0:
+                    normalized_data[i] = (channel_data - median) / iqr
+                else:
+                    mean = np.mean(valid_data)
+                    std = np.std(valid_data)
+                    if std > 0:
+                        normalized_data[i] = (channel_data - mean) / std
+                    else:
+                        normalized_data[i] = channel_data - mean
+                normalized_data[i][~valid_mask] = 0
+            else:
+                normalized_data[i] = channel_data
+        return normalized_data
+
+    def normalize_target(self, target):
+        """Normalize LST target (same as original)"""
+        normalized_target = np.zeros_like(target, dtype=np.float32)
+        for i in range(target.shape[0]):
+            channel_data = target[i].astype(np.float32)
+            valid_mask = ~np.isnan(channel_data)
+            if np.any(valid_mask):
+                valid_data = channel_data[valid_mask]
+                self.lst_median = np.median(valid_data)
+                q75, q25 = np.percentile(valid_data, [75, 25])
+                self.lst_iqr = q75 - q25
+                if self.lst_iqr > 0:
+                    normalized_target[i] = (channel_data - self.lst_median) / self.lst_iqr
+                else:
+                    self.lst_mean = np.mean(valid_data)
+                    self.lst_std = np.std(valid_data)
+                    if self.lst_std > 0:
+                        normalized_target[i] = (channel_data - self.lst_mean) / self.lst_std
+                    else:
+                        normalized_target[i] = channel_data - self.lst_mean
+                normalized_target[i][~valid_mask] = 0
+            else:
+                normalized_target[i] = channel_data
+        return normalized_target
+
+    def denormalize_target(self, normalized_target):
+        """Denormalize predicted LST values back to original scale"""
+        if hasattr(self, 'lst_median') and hasattr(self, 'lst_iqr') and self.lst_iqr > 0:
+            return normalized_target * self.lst_iqr + self.lst_median
+        elif hasattr(self, 'lst_mean') and hasattr(self, 'lst_std'):
+            return normalized_target * self.lst_std + self.lst_mean
+        else:
+            print("Warning: LST normalization parameters not found. Returning raw values.")
+            return normalized_target
+
+    # ---------- New pixel‑wise training data preparation for SVM ----------
+    def _extract_pixel_features(self, input_stack, target_map, sample_frac=0.3, max_samples=200000):
+        """
+        For a random subset of pixels, extract a square window (window_size x window_size)
+        around each pixel from all channels, flatten it into a feature vector.
+        The label is the target LST value at that pixel.
+        """
+        half = self.window_size  # use window_size as half (i.e., total window = 2*half+1)
+        total_window = 2 * half + 1
+        rows, cols = input_stack.shape[1], input_stack.shape[2]
+        # Pad input stack to handle borders
+        padded = np.pad(input_stack, ((0,0), (half, half), (half, half)), mode='reflect')
+        # Build list of valid pixel indices (exclude NaN target)
+        valid_mask = ~np.isnan(target_map)
+        valid_idx = np.argwhere(valid_mask)
+        n_valid = len(valid_idx)
+        n_sample = min(int(n_valid * sample_frac), max_samples)
+        if n_sample < 1000:  # ensure minimum samples
+            n_sample = min(10000, n_valid)
+        np.random.seed(42)
+        chosen = np.random.choice(n_valid, size=n_sample, replace=False)
+        features_list = []
+        labels_list = []
+        for idx in chosen:
+            r, c = valid_idx[idx]
+            window = padded[:, r:r+total_window, c:c+total_window].copy()
+            features_list.append(window.flatten())
+            labels_list.append(target_map[r, c])
+        X = np.array(features_list, dtype=np.float32)
+        y = np.array(labels_list, dtype=np.float32)
+        return X, y
+
+    def prepare_training_data(self):
+        """Prepare pixel‑wise training data for all three time periods."""
+        print("Preparing pixel‑wise training data for SVM...")
+        all_X, all_y = [], []
+
+        # 2015 data
+        input_stack_2015 = self._create_enhanced_features(
+            self.lst_data.arr_lu1, self.lst_data.arr_ndvi1, self.lst_data.arr_emiss1)
+        input_stack_2015 = self.normalize_data(input_stack_2015)
+        target_2015 = self.lst_data.arr_lst1
+        X1, y1 = self._extract_pixel_features(input_stack_2015, target_2015)
+        all_X.append(X1); all_y.append(y1)
+
+        # 2020 data
+        input_stack_2020 = self._create_enhanced_features(
+            self.lst_data.arr_lu2, self.lst_data.arr_ndvi2, self.lst_data.arr_emiss2)
+        input_stack_2020 = self.normalize_data(input_stack_2020)
+        target_2020 = self.lst_data.arr_lst2
+        X2, y2 = self._extract_pixel_features(input_stack_2020, target_2020)
+        all_X.append(X2); all_y.append(y2)
+
+        # 2025 data
+        input_stack_2025 = self._create_enhanced_features(
+            self.lst_data.arr_lu3, self.lst_data.arr_ndvi3, self.lst_data.arr_emiss3)
+        input_stack_2025 = self.normalize_data(input_stack_2025)
+        target_2025 = self.lst_data.arr_lst3
+        X3, y3 = self._extract_pixel_features(input_stack_2025, target_2025)
+        all_X.append(X3); all_y.append(y3)
+
+        X = np.concatenate(all_X, axis=0)
+        y = np.concatenate(all_y, axis=0)
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+        print(f"Training samples: {X_train.shape[0]}, Validation samples: {X_val.shape[0]}")
+        return X_train, X_val, y_train, y_val
+
+    # ---------- Model building and training (SVR) ----------
+    def build_model(self):
+        """
+        Build SVR model. Using RBF kernel, tune parameters as needed.
+        """
+        print("Building SVR model for LST prediction...")
+        # C and gamma can be tuned; defaults often work after robust feature scaling.
+        self.model = SVR(kernel='rbf', C=1.0, gamma='scale', epsilon=0.1, verbose=True)
+        print("SVR model built.")
+
+    def train(self, epochs=100, batch_size=8):
+        """
+        Train the SVR. epochs/batch_size ignored (SVR trained in one step).
+        """
+        X_train, X_val, y_train, y_val = self.prepare_training_data()
+        print(f"Training SVR on {X_train.shape[0]} samples...")
+        start_time = time.time()
+        self.model.fit(X_train, y_train)
+        train_time = time.time() - start_time
+        print(f"SVR training completed in {train_time:.2f} seconds.")
+
+        # Validation
+        y_pred = self.model.predict(X_val)
+        mse = mean_squared_error(y_val, y_pred)
+        mae = mean_absolute_error(y_val, y_pred)
+        r2 = r2_score(y_val, y_pred)
+        print(f"Validation MSE: {mse:.4f}, MAE: {mae:.4f}, R²: {r2:.4f}")
+
+        # Save model
+        joblib.dump(self.model, 'svr_lst_model.pkl')
+
+        # Dummy history for compatibility
+        return {'train_loss': [], 'val_loss': [], 'train_mae': [mae], 'val_mae': [mae]}
+
+    # ---------- Prediction using pixel‑wise SVR ----------
+    def predict_lst(self, landuse_map, ndvi_map, emissivity_map, apply_thermal_constraints=True,
+                    is_future_scenario=False):
+        """
+        Predict LST map using pixel‑wise SVR. Process pixels in batches for memory.
+        """
+        print("Predicting LST with SVR (pixel‑wise)...")
+        input_stack = self._create_enhanced_features(landuse_map, ndvi_map, emissivity_map)
+        input_stack = self.normalize_data(input_stack)
+
+        half = self.window_size
+        total_window = 2 * half + 1
+        rows, cols = input_stack.shape[1], input_stack.shape[2]
+        padded = np.pad(input_stack, ((0,0), (half, half), (half, half)), mode='reflect')
+
+        lst_prediction_norm = np.zeros((rows, cols), dtype=np.float32)
+        batch_size = 5000   # pixels per batch
+        total_pixels = rows * cols
+        idx_list = list(range(total_pixels))
+
+        for start in range(0, total_pixels, batch_size):
+            end = min(start + batch_size, total_pixels)
+            batch_idx = idx_list[start:end]
+            batch_features = []
+            coords = []
+            for idx in batch_idx:
+                r = idx // cols
+                c = idx % cols
+                window = padded[:, r:r+total_window, c:c+total_window]
+                batch_features.append(window.flatten())
+                coords.append((r, c))
+            batch_features = np.array(batch_features, dtype=np.float32)
+            preds = self.model.predict(batch_features)
+            for (r, c), val in zip(coords, preds):
+                lst_prediction_norm[r, c] = val
+            if start % (batch_size * 5) == 0:
+                print(f"  Predicted {end}/{total_pixels} pixels")
+
+        # Denormalize
+        lst_prediction = self.denormalize_target(lst_prediction_norm)
+
+        if apply_thermal_constraints:
+            lst_prediction = self._apply_thermal_constraints(lst_prediction, landuse_map, ndvi_map, is_future_scenario)
+
+        return lst_prediction
+
+    # ---------- Thermal constraints (unchanged from original) ----------
+    def _apply_thermal_constraints(self, lst_prediction, landuse_map, ndvi_map, is_future_scenario=False):
+        from scipy import ndimage
+        urban_mask = (landuse_map == 1)
+        vegetation_mask = (landuse_map == 2)
+        water_mask = (landuse_map == 3)
+
+        ndvi_effect = -ndvi_map * 2.5
+        ndvi_effect = np.clip(ndvi_effect, -5, 0)
+
+        if is_future_scenario:
+            urban_expansion_intensity = self._calculate_urban_expansion_intensity(landuse_map)
+            uhi_enhancement = urban_expansion_intensity * 8.5
+        else:
+            uhi_enhancement = np.zeros_like(lst_prediction)
+
+        lst_smoothed = ndimage.gaussian_filter(lst_prediction, sigma=0.8)
+        urban_density = self._calculate_urban_density(landuse_map)
+        alpha = 0.15 + 0.1 * urban_density
+        alpha = np.clip(alpha, 0.1, 0.3)
+
+        constrained_lst = lst_prediction * (1 - alpha) + lst_smoothed * alpha
+        constrained_lst = constrained_lst + ndvi_effect
+        constrained_lst[urban_mask] = constrained_lst[urban_mask] + uhi_enhancement[urban_mask]
+
+        min_temp = max(np.nanmin(self.lst_data.arr_lst1) - 3, 15)
+        max_temp = min(np.nanmax(self.lst_data.arr_lst3) + 10, 50)
+        constrained_lst = np.clip(constrained_lst, min_temp, max_temp)
+
+        if is_future_scenario:
+            warming_trend = self._calculate_warming_trend_addition()
+            constrained_lst = constrained_lst + warming_trend
+            print(f"  Applied warming trend: +{warming_trend:.2f}°C")
+
+        return constrained_lst
+
+    def _calculate_urban_expansion_intensity(self, landuse_map):
+        building_density = self.factors.factors[2]
+        population = self.factors.factors[7]
+        ntl = self.factors.factors[6]
+        urban_intensity = np.zeros_like(landuse_map, dtype=np.float32)
+        if np.nanmax(building_density) > 0:
+            urban_intensity += building_density / np.nanmax(building_density)
+        if np.nanmax(population) > 0:
+            urban_intensity += population / np.nanmax(population)
+        if np.nanmax(ntl) > 0:
+            urban_intensity += ntl / np.nanmax(ntl)
+        if np.nanmax(urban_intensity) > 0:
+            urban_intensity = urban_intensity / np.nanmax(urban_intensity)
+        urban_intensity[landuse_map != 1] = 0
+        return urban_intensity
+
+    def _calculate_urban_density(self, landuse_map, kernel_size=5):
+        urban_mask = (landuse_map == 1).astype(np.float32)
+        kernel = np.ones((kernel_size, kernel_size)) / (kernel_size * kernel_size)
+        urban_density = ndimage.convolve(urban_mask, kernel, mode='constant', cval=0.0)
+        return urban_density
+
+    def _calculate_warming_trend_addition(self):
+        if hasattr(self, 'temporal_trends') and 'warming_rate' in self.temporal_trends:
+            historical_warming_rate = self.temporal_trends['warming_rate']
+            future_warming = historical_warming_rate * 10 * 1.5
+            return max(future_warming, 1.5)
+        else:
+            return 1.8
+
+    # ---------- Evaluation, simulation, and analysis (mostly unchanged) ----------
+    def evaluate(self, actual_lst, predicted_lst):
+        print("\n=== ENHANCED EVALUATING LST MODEL ===")
+        valid_mask = ~np.isnan(actual_lst) & ~np.isnan(predicted_lst)
+        if np.sum(valid_mask) == 0:
+            raise ValueError("No valid pixels for evaluation.")
+        actual_flat = actual_lst[valid_mask].flatten()
+        predicted_flat = predicted_lst[valid_mask].flatten()
+        mse = mean_squared_error(actual_flat, predicted_flat)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(actual_flat, predicted_flat)
+        r2 = r2_score(actual_flat, predicted_flat)
+        bias = np.mean(predicted_flat - actual_flat)
+        relative_mae = mae / np.mean(np.abs(actual_flat))
+        relative_rmse = rmse / np.mean(actual_flat)
+        mse_climatology = np.mean((actual_flat - np.mean(actual_flat)) ** 2)
+        skill_score = 1 - (mse / mse_climatology) if mse_climatology > 0 else 0
+        print(f"\n=== LST EVALUATION RESULTS ===")
+        print(f"RMSE: {rmse:.3f}°C, MAE: {mae:.3f}°C, R²: {r2:.4f}, Bias: {bias:.3f}°C")
+        print(f"Relative MAE: {relative_mae:.4f}, Relative RMSE: {relative_rmse:.4f}, Skill Score: {skill_score:.4f}")
+        self.last_eval_metrics = {
+            'rmse': float(rmse), 'mae': float(mae), 'r2': float(r2),
+            'bias': float(bias), 'mse': float(mse),
+            'relative_mae': float(relative_mae), 'relative_rmse': float(relative_rmse),
+            'skill_score': float(skill_score), 'n_valid_pixels': int(np.sum(valid_mask))
+        }
+        return rmse, mae, r2
+
+    def simulate_future_lst(self, future_landuse_2035, future_landuse_2045,
+                            ndvi_2035=None, ndvi_2045=None,
+                            emissivity_2035=None, emissivity_2045=None):
+        print("\n=== SIMULATING FUTURE LST WITH SVR ===")
+        predictions = {}
+        if ndvi_2035 is None:
+            ndvi_2035 = self.lst_data.arr_ndvi3
+            print("Using 2025 NDVI for 2035")
+        if ndvi_2045 is None:
+            ndvi_2045 = self.lst_data.arr_ndvi3
+            print("Using 2025 NDVI for 2045")
+        if emissivity_2035 is None:
+            emissivity_2035 = self.lst_data.arr_emiss3
+            print("Using 2025 emissivity for 2035")
+        if emissivity_2045 is None:
+            emissivity_2045 = self.lst_data.arr_emiss3
+            print("Using 2025 emissivity for 2045")
+
+        urban_2035 = np.sum(future_landuse_2035 == 1)
+        urban_2045 = np.sum(future_landuse_2045 == 1)
+        urban_2025 = np.sum(self.lst_data.arr_lu3 == 1)
+        print(f"\nUrban area: 2025={urban_2025}, 2035={urban_2035}, 2045={urban_2045}")
+
+        print("\nPredicting LST for 2035...")
+        lst_2035 = self.predict_lst(future_landuse_2035, ndvi_2035, emissivity_2035,
+                                    apply_thermal_constraints=True, is_future_scenario=True)
+        predictions[2035] = lst_2035
+
+        print("Predicting LST for 2045...")
+        lst_2045 = self.predict_lst(future_landuse_2045, ndvi_2045, emissivity_2045,
+                                    apply_thermal_constraints=True, is_future_scenario=True)
+        predictions[2045] = lst_2045
+
+        # Warming analysis
+        lst_2025_mean = np.nanmean(self.lst_data.arr_lst3)
+        warming_2025_2035 = np.nanmean(lst_2035) - lst_2025_mean
+        warming_2035_2045 = np.nanmean(lst_2045) - np.nanmean(lst_2035)
+        total_warming = np.nanmean(lst_2045) - lst_2025_mean
+        print(f"\nProjected warming: 2025-2035: {warming_2025_2035:.2f}°C, 2035-2045: {warming_2035_2045:.2f}°C, Total: {total_warming:.2f}°C")
+        return predictions
+
+    def analyze_urban_heat_island_future(self, future_landuse, future_lst, year):
+        print(f"\n=== UHI ANALYSIS FOR {year} ===")
+        lst_by_class = {}
+        for lu_class in [1, 2, 3, 4]:
+            mask = (future_landuse == lu_class) & ~np.isnan(future_lst)
+            if np.any(mask):
+                lst_by_class[lu_class] = np.mean(future_lst[mask])
+                print(f"Land use class {lu_class}: {lst_by_class[lu_class]:.2f}°C ({np.sum(mask)} pixels)")
+            else:
+                lst_by_class[lu_class] = np.nan
+        if not np.isnan(lst_by_class.get(1, np.nan)) and not np.isnan(lst_by_class.get(2, np.nan)):
+            uhi_intensity = lst_by_class[1] - lst_by_class[2]
+            print(f"UHI intensity (urban - vegetation): {uhi_intensity:.2f}°C")
+        return lst_by_class
+
+# ============================================================================
+# Export and plotting utilities (unchanged)
+# ============================================================================
+def exportLST(array, outFileName, template_ds):
+    driver = gdal.GetDriverByName("GTiff")
+    outdata = driver.Create(outFileName, template_ds.RasterXSize, template_ds.RasterYSize, 1, gdal.GDT_Float32)
+    outdata.SetGeoTransform(template_ds.GetGeoTransform())
+    outdata.SetProjection(template_ds.GetProjection())
+    array_export = array.copy()
+    array_export[np.isnan(array_export)] = -9999
+    outdata.GetRasterBand(1).WriteArray(array_export)
+    outdata.GetRasterBand(1).SetNoDataValue(-9999)
+    outdata.FlushCache()
+    outdata = None
+    print(f"Exported {outFileName}")
+
+def plot_lst_comparison(historical_lst, predicted_lst, years):
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    for i, (year, lst) in enumerate(list(historical_lst.items())[:3]):
+        im = axes[0, i].imshow(lst, cmap='coolwarm', vmin=15, vmax=45)
+        axes[0, i].set_title(f'LST {year} (°C)')
+        axes[0, i].axis('off')
+        plt.colorbar(im, ax=axes[0, i])
+    for i, (year, lst) in enumerate(predicted_lst.items()):
+        im = axes[1, i].imshow(lst, cmap='coolwarm', vmin=15, vmax=45)
+        axes[1, i].set_title(f'Predicted LST {year} (°C)')
+        axes[1, i].axis('off')
+        plt.colorbar(im, ax=axes[1, i])
+    plt.tight_layout()
+    plt.savefig('lst_comparison_maps_svr.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    plt.figure(figsize=(10, 6))
+    historical_years = list(historical_lst.keys())
+    historical_means = [np.nanmean(lst) for lst in historical_lst.values()]
+    predicted_years = list(predicted_lst.keys())
+    predicted_means = [np.nanmean(lst) for lst in predicted_lst.values()]
+    plt.plot(historical_years, historical_means, 'bo-', linewidth=2, markersize=8, label='Historical')
+    plt.plot(predicted_years, predicted_means, 'ro-', linewidth=2, markersize=8, label='Predicted')
+    plt.xlabel('Year')
+    plt.ylabel('Mean LST (°C)')
+    plt.title('LST Trends (SVR)')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.savefig('lst_trends_svr.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+# ============================================================================
+# Main execution
+# ============================================================================
+if __name__ == "__main__":
+    # File paths (adjust as needed)
+    lst_files = ["ForLST/LST2015.tif", "ForLST/LST2020.tif", "ForLST/LST2025.tif"]
+    landuse_files = ["ForLST/2015_cleaned.tif", "ForLST/2020_cleaned.tif", "ForLST/2025_cleaned.tif"]
+    ndvi_files = ["ForLST/NDVI 2015.tif", "ForLST/NDVI 2020.tif", "ForLST/NDVI 2025.tif"]
+    emissivity_files = ["ForLST/Emissivity 2015.tif", "ForLST/Emissivity 2020.tif", "ForLST/Emissivity 2025.tif"]
+    factor_files = [
+        "ForLST/amenitykernel_cleaned.tif", "ForLST/building density.tif",
+        "ForLST/CBD_cleaned (1).tif", "ForLST/commercialkernel_cleaned.tif",
+        "ForLST/industrailkernel_cleaned.tif", "ForLST/ntl_cleaned.tif",
+        "ForLST/pop_cleaned.tif", "ForLST/restricted_cleaned.tif",
+        "ForLST/road density.tif", "ForLST/road_cleaned.tif",
+        "ForLST/slope_cleaned.tif"
+    ]
+    future_landuse_2035_file = "ForLST/predicted_2035_enhanced_transformer.tif"
+    future_landuse_2045_file = "ForLST/predicted_2045_enhanced_transformer.tif"
+
+    print("=== Loading Data ===")
+    lst_data = LSTData(lst_files, landuse_files, ndvi_files, emissivity_files)
+
+    print("\n=== Loading Factors ===")
+    lst_factors = LSTFactors(*factor_files)
+
+    print("\n=== Initializing SVR LST Simulator ===")
+    lst_simulator = LSTSimulator(lst_data, lst_factors, window_size=5)  # 11x11 window
+    lst_simulator.build_model()
+
+    print("\n=== Training SVR Model ===")
+    start_time = time.time()
+    history = lst_simulator.train()
+    end_time = time.time()
+    print(f"Training time: {(end_time - start_time) / 60:.2f} minutes")
+
+    print("\n=== Evaluating Model (Predicting 2025 LST) ===")
+    predicted_2025_lst = lst_simulator.predict_lst(
+        lst_data.arr_lu3, lst_data.arr_ndvi3, lst_data.arr_emiss3)
+    rmse, mae, r2 = lst_simulator.evaluate(lst_data.arr_lst3, predicted_2025_lst)
+    exportLST(predicted_2025_lst, 'predicted_2025_lst_svr.tif', lst_data.ds_lst1)
+
+    print("\n=== Loading Future Land Use Predictions ===")
+    _, future_landuse_2035 = readraster(future_landuse_2035_file)
+    _, future_landuse_2045 = readraster(future_landuse_2045_file)
+
+    print("\n=== Simulating Future LST (2035, 2045) ===")
+    future_lst = lst_simulator.simulate_future_lst(future_landuse_2035, future_landuse_2045)
+
+    for year, lst_pred in future_lst.items():
+        exportLST(lst_pred, f'predicted_lst_{year}_svr.tif', lst_data.ds_lst1)
+        future_lu = future_landuse_2035 if year == 2035 else future_landuse_2045
+        lst_simulator.analyze_urban_heat_island_future(future_lu, lst_pred, year)
+
+    historical_lst = {2015: lst_data.arr_lst1, 2020: lst_data.arr_lst2, 2025: lst_data.arr_lst3}
+    plot_lst_comparison(historical_lst, future_lst, [2035, 2045])
+
+    print("\n=== SVR LST SIMULATION COMPLETED SUCCESSFULLY ===")
+    print("Model: Support Vector Regression (RBF kernel)")
+    print(f"Validation RMSE={rmse:.3f}°C, MAE={mae:.3f}°C, R²={r2:.4f}")
